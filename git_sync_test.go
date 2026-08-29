@@ -306,3 +306,60 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 	}
 	return string(output)
 }
+
+// hookedRunner runs a callback right before the first `git push`, which lets a
+// test move the remote between our fetch and our push.
+type hookedRunner struct {
+	inner      commandRunner
+	beforePush func()
+	fired      bool
+}
+
+func (h *hookedRunner) run(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
+	if name == "git" && len(args) > 0 && args[0] == "push" && !h.fired {
+		h.fired = true
+		h.beforePush()
+	}
+	return h.inner.run(ctx, dir, stdin, name, args...)
+}
+
+func TestGitSyncRetriesWhenRemoteMovesDuringPush(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	other := filepath.Join(t.TempDir(), "other")
+	gitRun(t, "", "clone", "-q", remote, other)
+	configureGitUser(t, other)
+	if err := os.WriteFile(filepath.Join(local, "mine.txt"), []byte("mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &hookedRunner{inner: execCommandRunner{}, beforePush: func() {
+		writeAndCommit(t, other, "theirs.txt", "theirs\n", "teammate pushed first")
+		gitRun(t, other, "push", "-q", "origin", "main")
+	}}
+	report, err := gitSyncer{runner: runner}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+	if err != nil {
+		t.Fatalf("a rejected push must be retried, got: %v", err)
+	}
+	if !report.Pushed || !report.Pulled {
+		t.Fatalf("report = %+v, want pulled and pushed", report)
+	}
+	files := strings.Fields(gitOutput(t, local, "--git-dir", remote, "ls-tree", "-r", "--name-only", "main"))
+	if !reflect.DeepEqual(files, []string{"README.md", "mine.txt", "theirs.txt"}) {
+		t.Fatalf("remote files = %v; both commits must land without force-push", files)
+	}
+}
+
+func TestPushRejected(t *testing.T) {
+	rejected := []string{
+		"git push origin HEAD:main: exit status 1: remote: error: cannot lock ref 'refs/heads/main': is at abc but expected def",
+		"git push: ! [rejected] main -> main (fetch first)",
+		"git push: ! [rejected] main -> main (non-fast-forward)",
+	}
+	for _, message := range rejected {
+		if !pushRejected(errors.New(message)) {
+			t.Errorf("%q should count as rejected", message)
+		}
+	}
+	if pushRejected(errors.New("git push: could not resolve host: github.com")) {
+		t.Error("network errors are not rejections")
+	}
+}

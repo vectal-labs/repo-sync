@@ -98,26 +98,49 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 
 	remoteRef := repo.Remote + "/" + branch
 	remoteBefore, _ := s.revParse(ctx, repo.Path, remoteRef)
-	if _, err := runGit(ctx, s.runner, repo.Path, "fetch", repo.Remote); err != nil {
-		return report, err
-	}
-	remoteAfter, _ := s.revParse(ctx, repo.Path, remoteRef)
-	report.Pulled = remoteAfter != remoteBefore
-	if _, err := runGit(ctx, s.runner, repo.Path, "rebase", remoteRef); err != nil {
-		if s.rebaseInProgress(ctx, repo.Path) {
-			_, _ = runGit(ctx, s.runner, repo.Path, "rebase", "--abort")
-			return report, &skipError{reason: "rebase conflict with " + remoteRef + "; rebase aborted, will retry"}
-		}
-		return report, err
-	}
-	head, _ := s.revParse(ctx, repo.Path, "HEAD")
-	if head != remoteAfter {
-		if _, err := runGit(ctx, s.runner, repo.Path, "push", repo.Remote, "HEAD:"+branch); err != nil {
+	// Someone else may push between our fetch and our push. That is normal
+	// teamwork, not a failure: fetch, rebase, and push once more right away.
+	for attempt := 0; ; attempt++ {
+		if _, err := runGit(ctx, s.runner, repo.Path, "fetch", repo.Remote); err != nil {
 			return report, err
 		}
-		report.Pushed = true
+		remoteAfter, _ := s.revParse(ctx, repo.Path, remoteRef)
+		report.Pulled = remoteAfter != remoteBefore
+		if _, err := runGit(ctx, s.runner, repo.Path, "rebase", remoteRef); err != nil {
+			if s.rebaseInProgress(ctx, repo.Path) {
+				_, _ = runGit(ctx, s.runner, repo.Path, "rebase", "--abort")
+				return report, &skipError{reason: "rebase conflict with " + remoteRef + "; rebase aborted, will retry"}
+			}
+			return report, err
+		}
+		head, _ := s.revParse(ctx, repo.Path, "HEAD")
+		if head == remoteAfter {
+			return report, nil
+		}
+		_, err := runGit(ctx, s.runner, repo.Path, "push", repo.Remote, "HEAD:"+branch)
+		if err == nil {
+			report.Pushed = true
+			return report, nil
+		}
+		if !pushRejected(err) {
+			return report, err
+		}
+		if attempt >= 1 {
+			return report, &skipError{reason: "remote " + branch + " keeps moving during push; will retry"}
+		}
 	}
-	return report, nil
+}
+
+// pushRejected reports a non-fast-forward rejection: the remote branch moved
+// after we fetched it.
+func pushRejected(err error) bool {
+	message := err.Error()
+	for _, marker := range []string{"cannot lock ref", "fetch first", "non-fast-forward", "[rejected]", "stale info"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // preflight checks that the repository is safe to touch and returns the
