@@ -21,6 +21,7 @@ brews:
   - repository:
       owner: vectal-labs
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     directory: Formula
     homepage: https://github.com/vectal-labs/repo-sync
     description: Keeps your Git repositories in sync automatically on macOS
