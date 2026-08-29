@@ -17,14 +17,23 @@ archives:
 checksum:
   name_template: checksums.txt
 
-brews:
-  - repository:
+# Casks install a prebuilt binary without requiring Xcode. The post-install
+# hook clears quarantine because the binary is not notarized.
+homebrew_casks:
+  - name: repo-sync
+    repository:
       owner: vectal-labs
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    directory: Formula
+    directory: Casks
     homepage: https://github.com/vectal-labs/repo-sync
     description: Keeps your Git repositories in sync automatically on macOS
     license: MIT
-    install: bin.install "repo-sync"
+    binary: repo-sync
     caveats: Run `repo-sync setup` to choose repositories and install the background service.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/repo-sync"]
+          end

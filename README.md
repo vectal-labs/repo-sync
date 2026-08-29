@@ -9,7 +9,7 @@ built for notes, docs, config, and small team repos that should always be curren
 ## install
 
 ```sh
-brew install vectal-labs/tap/repo-sync
+brew install --cask vectal-labs/tap/repo-sync
 repo-sync setup
 ```
 
