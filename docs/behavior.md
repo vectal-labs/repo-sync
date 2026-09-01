@@ -1,5 +1,11 @@
 # how repo-sync behaves
 
+## setup
+
+- before writing the config or installing the service, setup verifies that background Git can fetch every configured repository without a terminal prompt.
+- for GitHub HTTPS repositories with missing credentials, setup uses GitHub CLI to configure Git. if needed, it starts the browser login and retries the checks.
+- stale global Git TLS-version pins are ignored. if authentication, TLS, or repository access still fails, setup stops before changing the config or service and reports the failing repositories.
+
 ## syncing
 
 - after 60 seconds without local edits, repo-sync commits every non-ignored change, including files you already staged. the commit message lists the files.
@@ -28,7 +34,9 @@
 - on a rebase conflict it runs `git rebase --abort`, keeps your local commits, and retries later. it never force-pushes and never resolves conflicts.
 - failures retry with backoff: 1 minute, doubling, up to 30 minutes. success resets it.
 - one failing repo never blocks another.
-- you get one macos notification when a repo starts failing, then silence until it recovers. being offline is not an incident.
+- being offline (dns, connection, reset, timeout) is not an incident. it never notifies; it just retries.
+- any other failure notifies once it has lasted 10 minutes, then silence until it recovers. repos that cross that line together share one notification. short blips stay silent.
+- if a file vanishes while staging, or the worktree changes right before the rebase, the cycle is skipped and retried. nothing is committed and no notification is sent.
 - there is no paused state and no `resume` command. if something cannot be done safely it logs, waits, and tries again.
 
 ## files

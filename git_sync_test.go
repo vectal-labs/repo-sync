@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -307,20 +308,56 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 	return string(output)
 }
 
-// hookedRunner runs a callback right before the first `git push`, which lets a
-// test move the remote between our fetch and our push.
+// hookedRunner runs a callback right before the first git command named
+// `command`, which lets a test change the world between two of our steps.
 type hookedRunner struct {
-	inner      commandRunner
-	beforePush func()
-	fired      bool
+	inner   commandRunner
+	command string
+	before  func()
+	fired   bool
 }
 
 func (h *hookedRunner) run(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
-	if name == "git" && len(args) > 0 && args[0] == "push" && !h.fired {
+	if name == "git" && slices.Contains(args, h.command) && !h.fired {
 		h.fired = true
-		h.beforePush()
+		h.before()
 	}
 	return h.inner.run(ctx, dir, stdin, name, args...)
+}
+
+func TestGitSyncSkipsWhenFileVanishesBeforeAdd(t *testing.T) {
+	_, local := makeGitFixture(t)
+	gone := filepath.Join(local, "gone.txt")
+	if err := os.WriteFile(gone, []byte("brief\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := gitOutput(t, local, "rev-parse", "HEAD")
+	runner := &hookedRunner{inner: execCommandRunner{}, command: "add", before: func() { os.Remove(gone) }}
+	_, err := gitSyncer{runner: runner}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+	var skip *skipError
+	if !errors.As(err, &skip) || !strings.Contains(skip.reason, "staging") {
+		t.Fatalf("a vanished file must be a skip, got: %v", err)
+	}
+	if after := gitOutput(t, local, "rev-parse", "HEAD"); after != before {
+		t.Fatal("skip must not commit anything")
+	}
+}
+
+func TestGitSyncSkipsWhenWorktreeChangesBeforeRebase(t *testing.T) {
+	_, local := makeGitFixture(t)
+	runner := &hookedRunner{inner: execCommandRunner{}, command: "rebase", before: func() {
+		if err := os.WriteFile(filepath.Join(local, "README.md"), []byte("edited mid-cycle\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	_, err := gitSyncer{runner: runner}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+	var skip *skipError
+	if !errors.As(err, &skip) || !strings.Contains(skip.reason, "rebase") {
+		t.Fatalf("a dirty worktree at rebase time must be a skip, got: %v", err)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); !strings.Contains(got, "README.md") {
+		t.Fatalf("the user's edit must survive untouched, status: %q", got)
+	}
 }
 
 func TestGitSyncRetriesWhenRemoteMovesDuringPush(t *testing.T) {
@@ -331,7 +368,7 @@ func TestGitSyncRetriesWhenRemoteMovesDuringPush(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(local, "mine.txt"), []byte("mine\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runner := &hookedRunner{inner: execCommandRunner{}, beforePush: func() {
+	runner := &hookedRunner{inner: execCommandRunner{}, command: "push", before: func() {
 		writeAndCommit(t, other, "theirs.txt", "theirs\n", "teammate pushed first")
 		gitRun(t, other, "push", "-q", "origin", "main")
 	}}

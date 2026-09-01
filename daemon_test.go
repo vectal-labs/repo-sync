@@ -63,6 +63,8 @@ func newTestDaemon(t *testing.T, names ...string) *testDaemon {
 		return td.clock
 	}
 	td.daemon.online = func(context.Context) bool { return true }
+	// Tests flush alerts by hand so the coalescing timer never races them.
+	td.daemon.alerts.window = time.Hour
 	td.daemon.notify = func(_ context.Context, _ commandRunner, message string) error {
 		td.mu.Lock()
 		td.messages = append(td.messages, message)
@@ -80,6 +82,7 @@ func (td *testDaemon) advance(delta time.Duration) {
 }
 
 func (td *testDaemon) notifications() []string {
+	td.alerts.flush()
 	td.mu.Lock()
 	defer td.mu.Unlock()
 	return append([]string(nil), td.messages...)
@@ -147,8 +150,8 @@ func TestFailuresBackOffPerRepoAndNotifyOnce(t *testing.T) {
 	if got := td.syncer.callCount("broken"); got != 2 {
 		t.Fatalf("broken synced %d times after backoff, want 2", got)
 	}
-	if got := td.notifications(); len(got) != 1 || !strings.Contains(got[0], "broken") {
-		t.Fatalf("notifications = %q, want exactly one for the incident", got)
+	if got := td.notifications(); len(got) != 0 {
+		t.Fatalf("a short failure must not notify yet: %q", got)
 	}
 	broken.mu.Lock()
 	failures, next := broken.failures, broken.nextAttempt
@@ -157,23 +160,63 @@ func TestFailuresBackOffPerRepoAndNotifyOnce(t *testing.T) {
 		t.Fatalf("failures = %d, next attempt in %s", failures, next.Sub(td.now()))
 	}
 
+	td.advance(failureNotifyAfter)
+	td.syncRepo(broken, true)
+	td.advance(time.Hour)
+	td.syncRepo(broken, true)
+	if got := td.notifications(); len(got) != 1 || !strings.Contains(got[0], "broken") {
+		t.Fatalf("notifications = %q, want exactly one for the incident", got)
+	}
+
 	td.syncer.results["broken"] = nil
 	td.advance(time.Hour)
 	td.syncRepo(broken, true)
 	broken.mu.Lock()
 	defer broken.mu.Unlock()
-	if broken.failures != 0 || broken.incident != "" || !broken.nextAttempt.IsZero() {
+	if broken.failures != 0 || broken.incident != "" || !broken.nextAttempt.IsZero() || broken.incidentNoted {
 		t.Fatalf("recovery did not reset state: %+v", broken)
 	}
 }
 
-func TestOfflineFailuresDoNotNotify(t *testing.T) {
+func TestOfflineFailuresNeverNotify(t *testing.T) {
 	td := newTestDaemon(t, "notes")
-	td.online = func(context.Context) bool { return false }
-	td.syncer.results["notes"] = func() (syncReport, error) { return syncReport{}, errors.New("could not resolve host") }
-	td.syncRepo(td.states["notes"], true)
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{}, errors.New("git fetch origin: fatal: unable to access 'https://github.com/x/notes.git/': Could not resolve host: github.com")
+	}
+	for i := 0; i < 5; i++ {
+		td.syncRepo(td.states["notes"], true)
+		td.advance(time.Hour)
+	}
 	if got := td.notifications(); len(got) != 0 {
 		t.Fatalf("offline failure produced notifications: %q", got)
+	}
+}
+
+func TestBurstOfFailingReposSharesOneNotification(t *testing.T) {
+	td := newTestDaemon(t, "comp", "legal", "ideas")
+	tlsError := errors.New("git fetch origin: exit status 128: fatal: unable to access 'https://github.com/x/y.git/': LibreSSL/3.3.6: error:1404B42E:SSL routines:ST_CONNECT:tlsv1 alert protocol version")
+	for name := range td.states {
+		td.syncer.results[name] = func() (syncReport, error) { return syncReport{}, tlsError }
+	}
+	syncAll := func() {
+		for _, state := range td.states {
+			td.syncRepo(state, true)
+		}
+	}
+	syncAll()
+	td.advance(failureNotifyAfter - time.Minute)
+	syncAll()
+	if got := td.notifications(); len(got) != 0 {
+		t.Fatalf("notified before the threshold: %q", got)
+	}
+	td.advance(2 * time.Minute)
+	syncAll()
+	got := td.notifications()
+	if len(got) != 1 {
+		t.Fatalf("notifications = %q, want one shared popup", got)
+	}
+	if !strings.Contains(got[0], "3 repositories") || !strings.Contains(got[0], "comp, ideas, legal") || !strings.Contains(got[0], "tlsv1") {
+		t.Fatalf("shared popup is missing the repos or the cause: %q", got[0])
 	}
 }
 

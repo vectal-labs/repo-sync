@@ -88,7 +88,7 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 		return report, err
 	}
 	if len(changed) > 0 {
-		return report, fmt.Errorf("worktree became dirty during commit; remote sync deferred")
+		return report, &skipError{reason: "worktree changed during commit; will retry"}
 	}
 	for _, entry := range blocked {
 		if entry.tracked() {
@@ -110,6 +110,11 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 			if s.rebaseInProgress(ctx, repo.Path) {
 				_, _ = runGit(ctx, s.runner, repo.Path, "rebase", "--abort")
 				return report, &skipError{reason: "rebase conflict with " + remoteRef + "; rebase aborted, will retry"}
+			}
+			// A file changed between our clean check and the rebase. Nothing is
+			// broken; the next cycle simply commits it first.
+			if strings.Contains(err.Error(), "cannot rebase:") {
+				return report, &skipError{reason: "worktree changed before rebase; will retry"}
 			}
 			return report, err
 		}
@@ -238,6 +243,11 @@ func (s gitSyncer) commit(ctx context.Context, repo repoConfig, changed []change
 		spec.WriteByte(0)
 	}
 	if _, err := s.runner.run(ctx, path, spec.String(), "git", "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
+		// A file listed by status vanished before add saw it (editors and
+		// agents create and delete files quickly). Retry from a fresh status.
+		if strings.Contains(err.Error(), "did not match any files") {
+			return 0, &skipError{reason: "files changed while staging; will retry"}
+		}
 		return 0, err
 	}
 	output, err := runGit(ctx, s.runner, path, "diff", "--cached", "--name-only", "-z")

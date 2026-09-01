@@ -34,6 +34,8 @@ type repoState struct {
 	failures       int
 	nextAttempt    time.Time
 	incident       string // non-empty while a failure incident is open
+	incidentSince  time.Time
+	incidentNoted  bool   // the open incident has already produced a popup
 	lastSkip       string // last skip reason logged, to avoid repeating it
 	offBranchSince time.Time
 	offBranchNoted bool
@@ -51,6 +53,7 @@ type daemon struct {
 	runner commandRunner
 	now    func() time.Time
 	online func(context.Context) bool
+	alerts *failureAlerts
 
 	healthInterval time.Duration
 	inflight       sync.WaitGroup
@@ -69,6 +72,7 @@ func newDaemon(ctx context.Context, cfg config, runner commandRunner, logger *lo
 
 		healthInterval: 10 * time.Second,
 	}
+	d.alerts = &failureAlerts{window: alertCoalesce, send: d.sendNotification}
 	for _, repo := range cfg.Repositories {
 		d.states[repo.Name] = &repoState{config: repo, secretsNoted: make(map[string]bool)}
 	}
@@ -278,6 +282,7 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) {
 		state.mu.Lock()
 		recovered := state.incident != ""
 		state.failures, state.incident, state.nextAttempt = 0, "", time.Time{}
+		state.incidentSince, state.incidentNoted = time.Time{}, false
 		state.lastSkip = ""
 		state.offBranchSince, state.offBranchNoted = time.Time{}, false
 		state.mu.Unlock()
@@ -310,14 +315,22 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) {
 	state.failures++
 	delay := backoffDelay(state.failures)
 	state.nextAttempt = now.Add(delay)
-	first := state.incident == ""
+	if state.incident == "" {
+		state.incidentSince = now
+	}
 	state.incident = err.Error()
+	// Being offline is not an incident worth a popup; it resolves itself. Other
+	// failures get one popup, and only once they have lasted long enough to be
+	// more than a blip.
+	alert := !state.incidentNoted && !isOfflineError(err) && now.Sub(state.incidentSince) >= failureNotifyAfter
+	if alert {
+		state.incidentNoted = true
+	}
 	state.mu.Unlock()
 	d.logger.Printf("%s sync failed (retry in %s): %v", name, delay.Round(time.Second), err)
 	state.scheduleIfAbsent(delay, func() { d.syncRepo(state, true) })
-	// Being offline is not an incident worth a popup; it resolves itself.
-	if first && d.online(d.opCtx) {
-		d.sendNotification(fmt.Sprintf("%s: sync is failing, retrying automatically. %v", name, err))
+	if alert {
+		d.alerts.add(name, err)
 	}
 }
 
@@ -488,6 +501,7 @@ func networkOnline(ctx context.Context) bool {
 }
 
 func (d *daemon) stopTimers() {
+	d.alerts.stop()
 	for _, state := range d.states {
 		state.mu.Lock()
 		if state.timer != nil {
