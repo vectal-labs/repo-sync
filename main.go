@@ -113,8 +113,14 @@ func runAdd(configPath, path string, out *os.File) error {
 	if err != nil {
 		return err
 	}
-	if _, err := runGit(context.Background(), execCommandRunner{}, root, "remote", "get-url", "origin"); err != nil {
+	runner := execCommandRunner{}
+	if _, err := runGit(context.Background(), runner, root, "remote", "get-url", "origin"); err != nil {
 		return fmt.Errorf("%s has no origin remote; repo-sync needs one to push to", root)
+	}
+	if err := verifyRepositories(context.Background(), runner, []repoConfig{{
+		Name: filepath.Base(root), Path: root, Remote: "origin",
+	}}, os.Stdin, out); err != nil {
+		return err
 	}
 	store := &configStore{path: configPath}
 	var added repoConfig

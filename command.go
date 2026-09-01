@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -16,6 +17,10 @@ type commandRunner interface {
 
 type execCommandRunner struct{}
 
+type interactiveCommandRunner interface {
+	runInteractive(ctx context.Context, dir string, in io.Reader, out io.Writer, name string, args ...string) error
+}
+
 var (
 	urlCredentials = regexp.MustCompile(`(https?://)[^\s/@]+(?::[^\s/@]*)?@`)
 	querySecret    = regexp.MustCompile(`(?i)(token|access_token|password)=[^&\s]+`)
@@ -26,6 +31,9 @@ func (execCommandRunner) run(ctx context.Context, dir, stdin, name string, args 
 	defer cancel()
 	cmd := exec.CommandContext(commandCtx, name, args...)
 	cmd.Dir = dir
+	// repo-sync is unattended. Never let Git wait for a terminal prompt, and
+	// ignore stale global TLS pins so Git can negotiate its secure default.
+	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSL_VERSION=")
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -41,6 +49,18 @@ func (execCommandRunner) run(ctx context.Context, dir, stdin, name string, args 
 		return output.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, cleanOutput)
 	}
 	return output.String(), nil
+}
+
+func (execCommandRunner) runInteractive(ctx context.Context, dir string, in io.Reader, out io.Writer, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.Stdin = in
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return nil
 }
 
 func redactCredentials(value string) string {
