@@ -52,7 +52,11 @@ func newTestDaemon(t *testing.T, names ...string) *testDaemon {
 	t.Helper()
 	cfg := newDefaultConfig()
 	for _, name := range names {
-		cfg.Repositories = append(cfg.Repositories, repoConfig{Name: name, Path: filepath.Join(t.TempDir(), name), Remote: "origin"})
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.MkdirAll(filepath.Join(path, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Repositories = append(cfg.Repositories, repoConfig{Name: name, Path: path, Remote: "origin"})
 	}
 	fake := &fakeSyncer{results: make(map[string]func() (syncReport, error)), calls: make(map[string]int)}
 	td := newTestDaemonWithSyncer(t, cfg, fake)
@@ -413,5 +417,69 @@ func TestCycleOwnsRepoUntilResultApplied(t *testing.T) {
 	}
 	if got := td.syncer.callCount("notes"); got != 2 {
 		t.Fatalf("notes synced %d times, want 2", got)
+	}
+}
+
+func TestMissingFolderBacksOffNotifiesOnceAndResumes(t *testing.T) {
+	td := newTestDaemon(t, "gone", "healthy")
+	gone := td.states["gone"]
+	if err := os.RemoveAll(gone.config.Path); err != nil {
+		t.Fatal(err)
+	}
+
+	td.syncRepo(gone, true)
+	td.syncRepo(gone, true) // inside the backoff window: must not run
+	td.syncRepo(td.states["healthy"], true)
+	if got := td.syncer.callCount("gone"); got != 0 {
+		t.Fatalf("git ran %d times in a missing folder", got)
+	}
+	if got := td.syncer.callCount("healthy"); got != 1 {
+		t.Fatal("a missing folder blocked a healthy repository")
+	}
+	td.healthCheck() // still missing: nothing to resume
+	gone.mu.Lock()
+	failures, next, unavailable := gone.failures, gone.nextAttempt, gone.unavailable
+	gone.mu.Unlock()
+	if failures != 1 || !unavailable || next.Sub(td.now()) != time.Minute {
+		t.Fatalf("failures = %d, unavailable = %v, next attempt in %s", failures, unavailable, next.Sub(td.now()))
+	}
+
+	td.advance(2 * time.Minute)
+	td.syncRepo(gone, true)
+	gone.mu.Lock()
+	failures, next = gone.failures, gone.nextAttempt
+	gone.mu.Unlock()
+	if failures != 2 || next.Sub(td.now()) != 2*time.Minute {
+		t.Fatalf("retries are not backing off: failures = %d, next attempt in %s", failures, next.Sub(td.now()))
+	}
+	if got := td.notifications(); len(got) != 0 {
+		t.Fatalf("a short absence must not notify: %q", got)
+	}
+
+	td.advance(failureNotifyAfter)
+	td.syncRepo(gone, true)
+	td.advance(time.Hour)
+	td.syncRepo(gone, true)
+	if got := td.notifications(); len(got) != 1 || !strings.Contains(got[0], "gone") || !strings.Contains(got[0], "missing") {
+		t.Fatalf("notifications = %q, want exactly one for the missing folder", got)
+	}
+
+	// The folder returns: the health check syncs it right away, ahead of the
+	// pending backoff, and the incident is closed.
+	if err := os.MkdirAll(filepath.Join(gone.config.Path, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	td.healthCheck()
+	deadline := time.Now().Add(2 * time.Second)
+	for td.syncer.callCount("gone") == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := td.syncer.callCount("gone"); got != 1 {
+		t.Fatalf("returned folder synced %d times, want 1", got)
+	}
+	gone.mu.Lock()
+	defer gone.mu.Unlock()
+	if gone.failures != 0 || gone.incident != "" || gone.unavailable || !gone.nextAttempt.IsZero() {
+		t.Fatalf("recovery did not reset state: failures=%d incident=%q unavailable=%v", gone.failures, gone.incident, gone.unavailable)
 	}
 }

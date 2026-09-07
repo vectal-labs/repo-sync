@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -23,8 +24,23 @@ const (
 	shutdownGrace        = 30 * time.Second
 )
 
+// errRepoMissing marks a sync attempt that found no repository at the
+// configured path: deleted, renamed, or on a volume that is not mounted.
+var errRepoMissing = errors.New("repository folder is missing")
+
+// repoMissing reports whether the repository is absent right now. It looks
+// for .git rather than the folder so an empty mount point also counts.
+func repoMissing(path string) bool {
+	_, err := os.Stat(filepath.Join(path, ".git"))
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 type repoState struct {
-	config       repoConfig
+	config repoConfig
+	// watchPath is the symlink-resolved path FSEvents reports under. It is set
+	// once before any goroutine starts and stays empty when the folder was
+	// missing at startup; such repositories are covered by the health poll.
+	watchPath    string
 	mu           sync.Mutex
 	syncing      bool
 	timer        *time.Timer
@@ -37,6 +53,7 @@ type repoState struct {
 	incidentSince  time.Time
 	incidentNoted  bool // the open incident has already produced a popup
 	lastSuccess    time.Time
+	unavailable    bool   // the last attempt found the folder missing
 	lastSkip       string // last skip reason logged, to avoid repeating it
 	offBranchSince time.Time
 	offBranchNoted bool
@@ -107,25 +124,31 @@ func (d *daemon) run() error {
 	}
 	paths := make([]string, 0, len(d.states))
 	for _, state := range d.states {
+		// A folder that is not there is a failure of that one repository, never
+		// a reason to stop the service. It keeps its config and the health loop
+		// polls for it until it returns.
 		resolved, err := filepath.EvalSymlinks(state.config.Path)
 		if err != nil {
-			return fmt.Errorf("repository %s: %w", state.config.Name, err)
+			d.logger.Printf("%s: cannot watch %s (%v); polling every %s until it returns", state.config.Name, state.config.Path, err, d.healthInterval)
+			continue
 		}
-		state.config.Path = resolved
+		state.watchPath = resolved
 		paths = append(paths, resolved)
 	}
 
-	stream := &fsevents.EventStream{
-		Paths: paths, Latency: 250 * time.Millisecond,
-		Flags: fsevents.FileEvents | fsevents.NoDefer,
-	}
-	if err := stream.Start(); err != nil {
-		// File watching is an optimisation. The health loop polls git status
-		// anyway, so keep running rather than giving up.
-		d.logger.Printf("file watching unavailable (%v); polling every %s instead", err, d.healthInterval)
-	} else {
-		defer stream.Stop()
-		go d.consumeEvents(stream.Events)
+	if len(paths) > 0 {
+		stream := &fsevents.EventStream{
+			Paths: paths, Latency: 250 * time.Millisecond,
+			Flags: fsevents.FileEvents | fsevents.NoDefer,
+		}
+		if err := stream.Start(); err != nil {
+			// File watching is an optimisation. The health loop polls git status
+			// anyway, so keep running rather than giving up.
+			d.logger.Printf("file watching unavailable (%v); polling every %s instead", err, d.healthInterval)
+		} else {
+			defer stream.Stop()
+			go d.consumeEvents(stream.Events)
+		}
 	}
 	d.logger.Printf("watching %d repositories", len(d.states))
 	if err := d.publishStatus(); err != nil {
@@ -185,7 +208,10 @@ func (d *daemon) consumeEvents(events <-chan []fsevents.Event) {
 
 func (d *daemon) handlePath(path string) {
 	for _, state := range d.states {
-		relative, err := filepath.Rel(state.config.Path, path)
+		if state.watchPath == "" {
+			continue
+		}
+		relative, err := filepath.Rel(state.watchPath, path)
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			continue
 		}
@@ -268,8 +294,27 @@ func (s *repoState) isAvailable(now time.Time) bool {
 	return !s.syncing && !now.Before(s.nextAttempt)
 }
 
+func (s *repoState) isUnavailable() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unavailable
+}
+
+// resumeNow drops the pending retry and its backoff so the repository syncs at
+// once, e.g. the moment a missing folder is back.
+func (s *repoState) resumeNow(callback func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unavailable, s.nextAttempt = false, time.Time{}
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+	s.setTimerLocked(0, callback)
+}
+
 func (d *daemon) syncRepo(state *repoState, commitLocal bool) {
-	if !commitLocal {
+	missing := repoMissing(state.config.Path)
+	if !commitLocal && !missing {
 		if !state.isAvailable(d.now()) {
 			return
 		}
@@ -290,7 +335,15 @@ func (d *daemon) syncRepo(state *repoState, commitLocal bool) {
 	// The cycle owns the repository until its result and retry decision are
 	// applied. Releasing right after the Git work let a newer cycle succeed in
 	// between, only to have this cycle's older failure overwrite it.
-	report, err := d.syncer.sync(d.opCtx, state.config, commitLocal)
+	var report syncReport
+	var err error
+	if missing {
+		// Never run git in a folder that is gone. A missing folder is handled
+		// like any other failure: backoff, one delayed popup, automatic recovery.
+		err = fmt.Errorf("%w: %s", errRepoMissing, state.config.Path)
+	} else {
+		report, err = d.syncer.sync(d.opCtx, state.config, commitLocal)
+	}
 	if report.Scanned {
 		d.reportSecrets(state, report.Blocked)
 	}
@@ -312,7 +365,7 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) ti
 		state.mu.Lock()
 		recovered := state.incident != ""
 		state.failures, state.incident, state.nextAttempt = 0, "", time.Time{}
-		state.incidentSince, state.incidentNoted = time.Time{}, false
+		state.incidentSince, state.incidentNoted, state.unavailable = time.Time{}, false, false
 		state.lastSkip = ""
 		state.lastSuccess = d.now()
 		state.offBranchSince, state.offBranchNoted = time.Time{}, false
@@ -341,6 +394,9 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) ti
 		return 0
 	}
 
+	// The folder may also vanish in the middle of a sync, which surfaces as a
+	// plain git error. Either way the health loop must poll for its return.
+	unavailable := errors.Is(err, errRepoMissing) || repoMissing(state.config.Path)
 	now := d.now()
 	state.mu.Lock()
 	state.failures++
@@ -350,6 +406,7 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) ti
 		state.incidentSince = now
 	}
 	state.incident = err.Error()
+	state.unavailable = unavailable
 	// Being offline is not an incident worth a popup; it resolves itself. Other
 	// failures get one popup, and only once they have lasted long enough to be
 	// more than a blip.
@@ -468,9 +525,16 @@ func (d *daemon) healthLoop() {
 	}
 }
 
-// healthCheck catches local changes whose file events were missed.
+// healthCheck catches local changes whose file events were missed and brings
+// back repositories whose folder has returned.
 func (d *daemon) healthCheck() {
 	for _, state := range d.states {
+		if state.isUnavailable() {
+			if !repoMissing(state.config.Path) {
+				state.resumeNow(func() { d.syncRepo(state, true) })
+			}
+			continue
+		}
 		if !state.isAvailable(d.now()) {
 			continue
 		}
