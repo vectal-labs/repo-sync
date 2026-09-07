@@ -6,13 +6,13 @@ You edit. After 60 seconds of quiet, repo-sync commits, pulls, and pushes. It st
 
 For notes, docs, config, and small team repos. macOS only.
 
-![Three teammates editing notes, docs, and team context, kept up to date by repo-sync and GitHub](docs/team-sync.png)
-
 ## Install
 
 ```sh
 brew install --cask vectal-labs/tap/repo-sync && repo-sync setup
 ```
+
+![Three teammates editing notes, docs, and team context, kept up to date by repo-sync and GitHub](docs/team-sync.png)
 
 Requires [Homebrew](https://brew.sh). Git and GitHub CLI are installed for you.
 
