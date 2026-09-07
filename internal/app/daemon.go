@@ -58,6 +58,7 @@ type repoState struct {
 	offBranchSince time.Time
 	offBranchNoted bool
 	secretsNoted   map[string]bool
+	withheldNoted  map[string]bool // secret paths in unpublished commits already reported
 }
 
 type daemon struct {
@@ -93,7 +94,7 @@ func newDaemon(ctx context.Context, cfg config, runner commandRunner, logger *lo
 	}
 	d.alerts = &failureAlerts{window: alertCoalesce, send: d.sendNotification}
 	for _, repo := range cfg.Repositories {
-		d.states[repo.Name] = &repoState{config: repo, secretsNoted: make(map[string]bool)}
+		d.states[repo.Name] = &repoState{config: repo, secretsNoted: make(map[string]bool), withheldNoted: make(map[string]bool)}
 	}
 	return d
 }
@@ -347,6 +348,9 @@ func (d *daemon) syncRepo(state *repoState, commitLocal bool) {
 	if report.Scanned {
 		d.reportSecrets(state, report.Blocked)
 	}
+	if report.Checked {
+		d.reportWithheld(state, report)
+	}
 	next := d.handleResult(state, report, err)
 	if next == 0 {
 		changed, _, statusErr := d.syncer.changes(d.opCtx, state.config)
@@ -475,6 +479,69 @@ func (d *daemon) reportSecrets(state *repoState, blocked []string) {
 	d.logger.Printf("%s: left secret file(s) out of sync: %s", state.config.Name, strings.Join(fresh, ", "))
 	d.sendNotification(fmt.Sprintf("%s: %d secret file(s) were not synced (%s). Run `repo-sync allow <path>` inside the repo to include one.",
 		state.config.Name, len(fresh), strings.Join(fresh, ", ")))
+}
+
+// reportWithheld notifies once per secret path while a push stays held back
+// because an unpublished commit adds or changes it. repo-sync never edits the
+// user's commits to remove it; the message explains the manual way out, which
+// differs for a file the remote already tracks.
+func (d *daemon) reportWithheld(state *repoState, report syncReport) {
+	current := make(map[string]bool, len(report.Withheld))
+	for _, entry := range report.Withheld {
+		current[entry.Path] = true
+	}
+	var fresh []withheldSecret
+	state.mu.Lock()
+	for path := range state.withheldNoted {
+		if !current[path] {
+			delete(state.withheldNoted, path)
+		}
+	}
+	for _, entry := range report.Withheld {
+		if !state.withheldNoted[entry.Path] {
+			state.withheldNoted[entry.Path] = true
+			fresh = append(fresh, entry)
+		}
+	}
+	state.mu.Unlock()
+	if len(fresh) == 0 {
+		return
+	}
+	name := state.config.Name
+	d.logger.Printf("%s: push held back; unpublished commits add or change secret file(s): %s", name, withheldList(fresh))
+	d.sendNotification(fmt.Sprintf("%s: push held back. Unpublished commits add or change %d secret file(s): %s. %s Or run `repo-sync allow <path>` inside the repo. It retries automatically.",
+		name, len(fresh), withheldList(fresh), withheldAdvice(fresh, state.config.Remote+"/"+report.Branch)))
+}
+
+// withheldAdvice explains how to get a held push moving again without
+// repo-sync touching the user's commits. A commit that is already on the fetch
+// source cannot be removed by any local reset, so that case is named as such.
+func withheldAdvice(withheld []withheldSecret, upstream string) string {
+	var local, fresh, tracked, onSource []string
+	for _, entry := range withheld {
+		switch {
+		case entry.OnSource:
+			onSource = append(onSource, entry.Path)
+		case entry.Tracked:
+			local, tracked = append(local, entry.Path), append(tracked, entry.Path)
+		default:
+			local, fresh = append(local, entry.Path), append(fresh, entry.Path)
+		}
+	}
+	var advice []string
+	if len(local) > 0 {
+		advice = append(advice, fmt.Sprintf("Drop them from your unpublished commits, e.g. `git reset --soft %s`; repo-sync then recommits everything else.", upstream))
+	}
+	if len(fresh) > 0 {
+		advice = append(advice, fmt.Sprintf("It leaves %s out.", strings.Join(fresh, ", ")))
+	}
+	if len(tracked) > 0 {
+		advice = append(advice, fmt.Sprintf("The remote already tracks %s, so local changes to it never publish: save them outside the repo, then restore the published version with `git checkout %s -- <path>`.", strings.Join(tracked, ", "), upstream))
+	}
+	if len(onSource) > 0 {
+		advice = append(advice, fmt.Sprintf("%s is already on %s but not at the separate push destination; no local reset removes it. Either point the push URL at a destination that has it (`git remote set-url --push`), or run `repo-sync allow <path>` to publish it there too.", strings.Join(onSource, ", "), upstream))
+	}
+	return strings.Join(advice, " ")
 }
 
 func (d *daemon) sendNotification(message string) {

@@ -47,6 +47,12 @@
 - a blocked file is left out. everything else still syncs. you get one notification per file.
 - a blocked file you staged by hand is unstaged so it never reaches the remote.
 - `repo-sync allow <file>` inside the repo overrides the guard for that file. the list is in [`internal/app/secrets.go`](../internal/app/secrets.go).
+- before every push, the exact commits about to be published are checked with the same filename rules, against what the push destination actually holds. a commit that adds or changes a blocked file holds the push back, whether you committed it by hand, a hook staged it, or it was staged at the last moment. a secret committed and deleted again in a later unpublished commit is still caught. replacement refs (`git replace`) are ignored; the real objects are inspected.
+- a held push retries automatically. repo-sync does not edit your commits to remove the file and does not delete it. you get one notification per file naming the file and commit. drop the file from your unpublished commits (for example `git reset --soft origin/main`; repo-sync then recommits everything else and leaves the file out) or run `repo-sync allow <file>`. other repositories keep syncing.
+- if the remote fetches from one url and pushes to another, a secret commit that is already on the fetch source but not at the push destination is still held. no local reset removes it: fix the push url or allow the file.
+- a blocked file the remote already tracks does not freeze unrelated pushes, and a commit that only deletes one still pushes. local changes to such a file never publish: save them outside the repo and restore the published version with `git checkout origin/main -- <file>`.
+- the push publishes exactly the validated commit, and only if the destination still holds the tip it was validated against. if the destination moved meanwhile, it fetches and validates again. that is a compare-and-swap, not a force-push: the destination must be part of local history or nothing is pushed.
+- submodule commits are never pushed on your behalf. the parent push waits until they are on the submodule's remote; sync the submodule as its own repository or push it yourself.
 
 ## conflicts and failures
 

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -158,5 +159,34 @@ func TestGitStatusWarningDoesNotInventFiles(t *testing.T) {
 	message := gitOutput(t, local, "log", "-1", "--pretty=%B")
 	if !strings.Contains(message, "- README.md\n- real change.txt\n") || strings.Contains(message, "warning") {
 		t.Fatalf("commit message lists wrong files:\n%s", message)
+	}
+}
+
+func TestCommandRunnerRedactsCredentialsInArguments(t *testing.T) {
+	var warnings []string
+	runner := execCommandRunner{warn: func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}}
+	url := "https://review-user:review-credential@example.com/repo.git?token=review-token"
+	// The failing command still receives the raw argument.
+	output, err := runner.run(context.Background(), "", "", "/bin/sh", "-c", `echo "$1"; exit 1`, "sh", url)
+	if err == nil || output != url+"\n" {
+		t.Fatalf("command must run with the raw argument: output=%q err=%v", output, err)
+	}
+	if strings.Contains(err.Error(), "review-credential") || strings.Contains(err.Error(), "review-token") {
+		t.Fatalf("error leaked a credential from the command line: %v", err)
+	}
+	if !strings.Contains(err.Error(), "https://***@example.com/repo.git?token=***") {
+		t.Fatalf("error should keep the redacted command line: %v", err)
+	}
+	// A warning from a successful command is prefixed with the command line too.
+	if _, err := runner.run(context.Background(), "", "", "/bin/sh", "-c", `echo warn >&2`, "sh", url); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 1 || strings.Contains(warnings[0], "review-credential") || strings.Contains(warnings[0], "review-token") {
+		t.Fatalf("warning leaked a credential from the command line: %q", warnings)
+	}
+	if err := runner.runInteractive(context.Background(), "", nil, io.Discard, "/bin/sh", "-c", "exit 1", "sh", url); err == nil || strings.Contains(err.Error(), "review-credential") {
+		t.Fatalf("interactive error leaked a credential: %v", err)
 	}
 }
