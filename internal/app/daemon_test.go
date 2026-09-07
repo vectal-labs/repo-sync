@@ -483,3 +483,152 @@ func TestMissingFolderBacksOffNotifiesOnceAndResumes(t *testing.T) {
 		t.Fatalf("recovery did not reset state: failures=%d incident=%q unavailable=%v", gone.failures, gone.incident, gone.unavailable)
 	}
 }
+
+func TestWithheldPushNotifiesOncePerIncident(t *testing.T) {
+	td := newTestDaemon(t, "notes")
+	withheld := []withheldSecret{{Path: ".env", Commit: "abc1234"}}
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{Branch: "main", Checked: true, Withheld: withheld}, &skipError{reason: "push withheld"}
+	}
+	state := td.states["notes"]
+	td.syncRepo(state, true)
+	td.syncRepo(state, true)
+	got := td.notifications()
+	if len(got) != 1 || !strings.Contains(got[0], ".env (abc1234)") || !strings.Contains(got[0], "repo-sync allow") || !strings.Contains(got[0], "git reset --soft origin/main") {
+		t.Fatalf("notifications = %q, want one with file, commit, and the way out", got)
+	}
+	if got := td.syncer.callCount("notes"); got != 2 {
+		t.Fatalf("a held push must keep retrying without backoff; synced %d times", got)
+	}
+	// A cycle that never reached the push check keeps the incident open.
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{}, errors.New("git fetch origin: could not resolve host: github.com")
+	}
+	td.syncRepo(state, true)
+	td.advance(time.Hour)
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{Branch: "main", Checked: true, Withheld: withheld}, &skipError{reason: "push withheld"}
+	}
+	td.syncRepo(state, true)
+	if got := td.notifications(); len(got) != 1 {
+		t.Fatalf("an offline blip must not repeat the popup: %q", got)
+	}
+	// Resolved, then held again: a new incident notifies again.
+	td.syncer.results["notes"] = func() (syncReport, error) { return syncReport{Branch: "main", Checked: true, Pushed: true}, nil }
+	td.syncRepo(state, true)
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{Branch: "main", Checked: true, Withheld: withheld}, &skipError{reason: "push withheld"}
+	}
+	td.syncRepo(state, true)
+	if got := td.notifications(); len(got) != 2 {
+		t.Fatalf("notifications = %q, want two", got)
+	}
+}
+
+// TestDaemonHoldsSecretPushWhileOtherRepoKeepsSyncing drives the real git
+// syncer through the daemon: one repository with a hand-made secret commit,
+// one healthy.
+func TestDaemonHoldsSecretPushWhileOtherRepoKeepsSyncing(t *testing.T) {
+	leakyRemote, leaky := makeGitFixture(t)
+	cleanRemote, clean := makeGitFixture(t)
+	cfg := newDefaultConfig()
+	cfg.Repositories = []repoConfig{
+		{Name: "leaky", Path: leaky, Remote: "origin"},
+		{Name: "clean", Path: clean, Remote: "origin"},
+	}
+	var mu sync.Mutex
+	var messages []string
+	d := newDaemon(context.Background(), cfg, execCommandRunner{}, log.New(io.Discard, "", 0))
+	d.notify = func(_ context.Context, _ commandRunner, message string) error {
+		mu.Lock()
+		messages = append(messages, message)
+		mu.Unlock()
+		return nil
+	}
+	t.Cleanup(d.stopTimers)
+
+	writeAndCommit(t, leaky, ".env", "TOKEN=1\n", "by hand")
+	write(t, clean, "note.md", "fine\n")
+	d.syncRepo(d.states["leaky"], true)
+	d.syncRepo(d.states["leaky"], true)
+	d.syncRepo(d.states["clean"], true)
+
+	if tree := gitOutput(t, leaky, "--git-dir", leakyRemote, "ls-tree", "-r", "--name-only", "main"); strings.Contains(tree, ".env") {
+		t.Fatalf(".env reached the remote:\n%s", tree)
+	}
+	if tree := gitOutput(t, clean, "--git-dir", cleanRemote, "ls-tree", "-r", "--name-only", "main"); !strings.Contains(tree, "note.md") {
+		t.Fatalf("the healthy repository stopped syncing:\n%s", tree)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(messages) != 1 || !strings.Contains(messages[0], "leaky") || !strings.Contains(messages[0], ".env") || strings.Contains(messages[0], "TOKEN") {
+		t.Fatalf("messages = %q, want one for leaky naming .env without contents", messages)
+	}
+}
+
+// failingRunner fails one git subcommand and passes everything else through.
+type failingRunner struct {
+	inner      commandRunner
+	subcommand string
+}
+
+func (f failingRunner) run(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
+	for _, arg := range args {
+		if arg == f.subcommand {
+			return "", errors.New("git " + f.subcommand + ": temporary failure")
+		}
+	}
+	return f.inner.run(ctx, dir, stdin, name, args...)
+}
+
+func TestFailedScanKeepsWithheldIncidentOpen(t *testing.T) {
+	_, local := makeGitFixture(t)
+	writeAndCommit(t, local, ".env", "TOKEN=1\n", "by hand")
+	td := newGitTestDaemon(t, "notes", local)
+	state := td.states["notes"]
+	td.syncRepo(state, true)
+	if got := td.notifications(); len(got) != 1 {
+		t.Fatalf("notifications = %q, want one", got)
+	}
+	// A cycle whose inspection fails must not count as "nothing withheld".
+	td.daemon.syncer = gitSyncer{runner: failingRunner{inner: execCommandRunner{}, subcommand: "diff-tree"}}
+	td.syncRepo(state, true)
+	td.advance(time.Hour)
+	td.daemon.syncer = gitSyncer{runner: execCommandRunner{}}
+	td.syncRepo(state, true)
+	if got := td.notifications(); len(got) != 1 {
+		t.Fatalf("a failed scan re-notified the same incident: %q", got)
+	}
+}
+
+// TestDaemonNeverLogsPushURLCredentials runs the real daemon against a push
+// URL carrying a synthetic password that fails to connect; neither the log nor
+// the stored incident may contain it.
+func TestDaemonNeverLogsPushURLCredentials(t *testing.T) {
+	_, local := makeGitFixture(t)
+	write(t, local, "safe.txt", "safe\n")
+	gitRun(t, local, "remote", "set-url", "--push", "origin", "http://review-user:review-credential@127.0.0.1:1/repo.git")
+	cfg := config{IdleDebounce: duration{100 * time.Millisecond}, FetchInterval: duration{500 * time.Millisecond},
+		Repositories: []repoConfig{{Name: "notes", Path: local, Remote: "origin"}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logs := &syncBuffer{}
+	d := newDaemon(ctx, cfg, execCommandRunner{}, log.New(logs, "", 0))
+	d.healthInterval = 100 * time.Millisecond
+	d.online = func(context.Context) bool { return true }
+	d.notify = func(context.Context, commandRunner, string) error { return nil }
+	done := make(chan error, 1)
+	go func() { done <- d.run() }()
+	waitForOrStop(t, "remote failure is logged", func() bool { return strings.Contains(logs.String(), "sync failed") }, done)
+	stopDaemon(t, done, cancel)
+	if strings.Contains(logs.String(), "review-credential") {
+		t.Fatal("the daemon wrote the push URL password to its log")
+	}
+	state := d.states["notes"]
+	state.mu.Lock()
+	incident := state.incident
+	state.mu.Unlock()
+	if incident == "" || strings.Contains(incident, "review-credential") {
+		t.Fatalf("incident must be recorded without the password (empty=%v)", incident == "")
+	}
+}

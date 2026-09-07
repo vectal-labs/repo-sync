@@ -106,10 +106,10 @@ func (r execCommandRunner) run(ctx context.Context, dir, stdin, name string, arg
 	}
 	if err != nil {
 		diagnostics := redactCredentials(strings.TrimSpace(stderr.String() + "\n" + stdout.String()))
-		return stdout.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, diagnostics)
+		return stdout.String(), fmt.Errorf("%s: %w: %s", commandLine(name, args), err, diagnostics)
 	}
 	if warning := strings.TrimSpace(stderr.String()); warning != "" && r.warn != nil {
-		r.warn("%s %s: %s", name, strings.Join(args, " "), redactCredentials(warning))
+		r.warn("%s: %s", commandLine(name, args), redactCredentials(warning))
 	}
 	return stdout.String(), nil
 }
@@ -121,9 +121,16 @@ func (r execCommandRunner) runInteractive(ctx context.Context, dir string, in io
 	cmd.Stdout = out
 	cmd.Stderr = out
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+		return fmt.Errorf("%s: %w", commandLine(name, args), err)
 	}
 	return nil
+}
+
+// commandLine renders a command for diagnostics. Arguments may carry a
+// remote URL with a token or password (a push URL, a ls-remote target), so
+// they are redacted here; the command itself still runs with the real values.
+func commandLine(name string, args []string) string {
+	return redactCredentials(name + " " + strings.Join(args, " "))
 }
 
 func redactCredentials(value string) string {

@@ -34,6 +34,30 @@ type syncReport struct {
 	Committed int      // files committed this cycle
 	Pulled    bool     // remote default branch moved
 	Pushed    bool     // local commits were pushed
+	Branch    string   // remote default branch the checkout syncs with
+	Checked   bool     // unpublished commits were inspected; Withheld is meaningful
+	Withheld  []withheldSecret
+}
+
+// withheldSecret is a blocked path that an unpublished commit adds or changes.
+// Such a push is held back until the user drops or allows the file.
+type withheldSecret struct {
+	Path    string
+	Commit  string // abbreviated hash of the first commit touching the path
+	Tracked bool   // the push destination already has the file; local edits to it never publish
+	// OnSource means the commit is already on the fetch source and only the
+	// separate push destination lacks it. No local reset removes such a commit.
+	OnSource bool
+}
+
+func (w withheldSecret) String() string { return w.Path + " (" + w.Commit + ")" }
+
+func withheldList(withheld []withheldSecret) string {
+	parts := make([]string, 0, len(withheld))
+	for _, entry := range withheld {
+		parts = append(parts, entry.String())
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (r syncReport) String() string {
@@ -65,6 +89,7 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 	if err != nil {
 		return report, err
 	}
+	report.Branch = branch
 	changed, blocked, err := s.changes(ctx, repo)
 	if err != nil {
 		return report, err
@@ -119,11 +144,47 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 			}
 			return report, err
 		}
-		head, _ := s.revParse(ctx, repo.Path, "HEAD")
+		head, err := s.revParse(ctx, repo.Path, "HEAD")
+		if err != nil || head == "" {
+			return report, fmt.Errorf("resolve HEAD: %w", err) // an empty source would delete the remote branch
+		}
 		if head == remoteAfter {
+			report.Checked, report.Withheld = true, nil
 			return report, nil
 		}
-		_, err := runGit(ctx, s.runner, repo.Path, "push", repo.Remote, "HEAD:"+branch)
+		// Validate against what the push destination actually holds, and publish
+		// only if it still holds that when the push lands. The fetched tip is
+		// normally the destination tip; a remote with its own push URL is asked
+		// directly, because history the fetch source has may be missing there.
+		baseline, err := s.pushBaseline(ctx, repo, branch, remoteAfter)
+		if err != nil {
+			return report, err
+		}
+		if baseline != "" {
+			if _, err := runGit(ctx, s.runner, repo.Path, "--no-replace-objects", "merge-base", "--is-ancestor", baseline, head); err != nil {
+				return report, &skipError{reason: fmt.Sprintf("%s at the push destination (%s) is not part of local history; nothing is overwritten, will retry", branch, baseline[:7])}
+			}
+		}
+		// Inspect the exact commits about to be published. Hooks, late staging,
+		// and manual commits all bypass the worktree guard above.
+		withheld, err := s.outgoingSecrets(ctx, repo, baseline, remoteAfter, head)
+		if err != nil {
+			return report, err
+		}
+		report.Checked, report.Withheld = true, withheld
+		if len(withheld) > 0 {
+			return report, &skipError{reason: fmt.Sprintf("push withheld: unpublished commits add or change secret file(s) %s; drop them from your local commits or run `repo-sync allow <path>`", withheldList(withheld))}
+		}
+		// Push the validated commit itself, not HEAD, so nothing that lands on
+		// the branch after the check can ride along. The lease makes the update
+		// conditional on the destination still being at the validated baseline;
+		// with the ancestry check above it is always a fast-forward, never a
+		// force-push. Submodule commits are only checked, never pushed for you.
+		_, err = runGit(ctx, s.runner, repo.Path, "push", "--recurse-submodules=check",
+			"--force-with-lease=refs/heads/"+branch+":"+baseline, repo.Remote, head+":refs/heads/"+branch)
+		if paths := unpublishedSubmodules(err); len(paths) > 0 {
+			return report, fmt.Errorf("submodule %s has commits that are not on its remote; check out a branch in it and run `repo-sync add <path>`, or push it yourself", strings.Join(paths, ", "))
+		}
 		if err == nil {
 			report.Pushed = true
 			return report, nil
@@ -137,13 +198,122 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 	}
 }
 
+// pushBaseline returns the commit the push destination holds for branch, or
+// "" when the branch does not exist there. That is the fetched tip unless the
+// remote pushes somewhere else than it fetches from.
+func (s gitSyncer) pushBaseline(ctx context.Context, repo repoConfig, branch, fetched string) (string, error) {
+	fetchURL, err := runGit(ctx, s.runner, repo.Path, "remote", "get-url", repo.Remote)
+	if err != nil {
+		return "", err
+	}
+	pushURL, err := runGit(ctx, s.runner, repo.Path, "remote", "get-url", "--push", repo.Remote)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(pushURL) == strings.TrimSpace(fetchURL) {
+		return fetched, nil
+	}
+	output, err := runGit(ctx, s.runner, repo.Path, "ls-remote", "--heads", strings.TrimSpace(pushURL), "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(output, "\n") {
+		if fields := strings.Fields(line); len(fields) == 2 && fields[1] == "refs/heads/"+branch {
+			return fields[0], nil
+		}
+	}
+	return "", nil
+}
+
+// outgoingSecrets lists blocked paths that any commit in base..head adds or
+// changes. Every commit is inspected on its own, so a secret committed and
+// deleted again before the push is still caught. Deleting a blocked file, or
+// leaving one the destination already has untouched, is fine. No content is
+// read. Replacement refs are ignored: push publishes the real objects.
+func (s gitSyncer) outgoingSecrets(ctx context.Context, repo repoConfig, base, fetched, head string) ([]withheldSecret, error) {
+	span := head
+	if base != "" {
+		span = base + ".." + head
+	}
+	output, err := runGit(ctx, s.runner, repo.Path, "--no-replace-objects", "rev-list", "--reverse", span)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var withheld []withheldSecret
+	for _, commit := range strings.Fields(output) {
+		// -c makes a merge list only paths that differ from every parent, so
+		// content merged in unchanged from the remote is not flagged again.
+		files, err := runGit(ctx, s.runner, repo.Path, "--no-replace-objects", "diff-tree", "-r", "-c", "--root",
+			"--no-commit-id", "--name-only", "--diff-filter=d", "--no-renames", "-z", commit)
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range splitNUL(files) {
+			if seen[file] || !isSecretPath(file, repo.Allow) {
+				continue
+			}
+			seen[file] = true
+			tracked, err := s.inTree(ctx, repo.Path, base, file)
+			if err != nil {
+				return nil, err
+			}
+			onSource := false
+			if base != fetched && fetched != "" {
+				_, err := runGit(ctx, s.runner, repo.Path, "--no-replace-objects", "merge-base", "--is-ancestor", commit, fetched)
+				onSource = err == nil
+			}
+			withheld = append(withheld, withheldSecret{Path: file, Commit: commit[:7], Tracked: tracked, OnSource: onSource})
+		}
+	}
+	return withheld, nil
+}
+
+// inTree reports whether tree (a commit, or "" for none) contains file.
+func (s gitSyncer) inTree(ctx context.Context, path, tree, file string) (bool, error) {
+	if tree == "" {
+		return false, nil
+	}
+	output, err := runGit(ctx, s.runner, path, "--no-replace-objects", "--literal-pathspecs", "ls-tree", "-z", tree, "--", file)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range splitNUL(output) {
+		if _, name, ok := strings.Cut(entry, "\t"); ok && name == file {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// unpublishedSubmodules extracts the submodule paths a push refused to
+// publish ahead of, from `git push --recurse-submodules=check` output.
+func unpublishedSubmodules(err error) []string {
+	if err == nil {
+		return nil
+	}
+	_, rest, found := strings.Cut(err.Error(), "not be found on any remote:")
+	if !found {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(rest, "\n")[1:] {
+		if !strings.HasPrefix(line, "  ") {
+			break
+		}
+		paths = append(paths, strings.TrimSpace(line))
+	}
+	return paths
+}
+
 // Push rejections Git reports when the remote branch moved after our fetch.
-// The reason sits in parentheses at the end of a "[rejected]" line, or the
-// remote's compare-and-swap names the two object ids it saw. Anything else
+// The reason sits in parentheses at the end of a "[rejected]" line ("stale
+// info" is our own lease finding the destination elsewhere than validated),
+// or the remote's compare-and-swap names the two object ids it saw. Anything else
 // that mentions these words (a path, a branch name, a hook message) is not
 // evidence of a concurrent push.
 var (
-	pushRaceReason = regexp.MustCompile(`(?m)^ ! \[rejected\] .*\((fetch first|non-fast-forward)\)\s*$`)
+	pushRaceReason = regexp.MustCompile(`(?m)^ ! \[rejected\] .*\((fetch first|non-fast-forward|stale info)\)\s*$`)
 	pushRaceSwap   = regexp.MustCompile(`cannot lock ref '[^'\n]*': is at [0-9a-f]{7,64} but expected [0-9a-f]{7,64}`)
 )
 
