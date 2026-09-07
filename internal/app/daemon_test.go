@@ -95,7 +95,7 @@ func TestSyncDoesNotCancelPendingDebounce(t *testing.T) {
 	if ok, _ := state.beginSync(time.Now()); !ok {
 		t.Fatal("sync did not start")
 	}
-	state.endSync()
+	state.endSync(0, nil)
 	select {
 	case <-fired:
 	case <-time.After(time.Second):
@@ -269,5 +269,74 @@ func TestSecretFilesNotifyOncePerIncident(t *testing.T) {
 	td.syncRepo(state, true)
 	if got := td.notifications(); len(got) != 2 {
 		t.Fatalf("a new incident for the same file must notify again: %q", got)
+	}
+}
+
+// A cycle owns its repository until its result and retry decision are applied.
+// Releasing it after the Git work but before the bookkeeping let a newer cycle
+// succeed in between, only to be overwritten by the older failure.
+func TestCycleOwnsRepoUntilResultApplied(t *testing.T) {
+	td := newTestDaemon(t, "notes", "other")
+	state := td.states["notes"]
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{Scanned: true, Blocked: []string{".env"}}, errors.New("push rejected")
+	}
+	notifying := make(chan struct{})
+	release := make(chan struct{})
+	td.daemon.notify = func(context.Context, commandRunner, string) error {
+		close(notifying)
+		<-release
+		return nil
+	}
+	firstDone := make(chan struct{})
+	go func() {
+		td.syncRepo(state, true)
+		close(firstDone)
+	}()
+	<-notifying
+
+	// While the first cycle is still reporting, the same repository must not
+	// start another cycle, but other repositories keep syncing.
+	td.syncer.results["notes"] = nil
+	secondDone := make(chan struct{})
+	go func() {
+		td.syncRepo(state, true)
+		close(secondDone)
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second cycle waited on the first instead of being rejected")
+	}
+	if got := td.syncer.callCount("notes"); got != 1 {
+		t.Fatalf("notes synced %d times while a cycle was still finishing, want 1", got)
+	}
+	td.syncRepo(td.states["other"], true)
+	if got := td.syncer.callCount("other"); got != 1 {
+		t.Fatal("a finishing cycle in one repository blocked another repository")
+	}
+
+	close(release)
+	<-firstDone
+	state.mu.Lock()
+	failures, next, retryPending := state.failures, state.nextAttempt, state.timer != nil
+	state.mu.Unlock()
+	if failures != 1 || next.Sub(td.now()) != time.Minute {
+		t.Fatalf("first cycle's failure was not applied: failures=%d next attempt in %s", failures, next.Sub(td.now()))
+	}
+	if !retryPending {
+		t.Fatal("retry was not scheduled once the cycle released the repository")
+	}
+
+	// The retry runs the next cycle in order and recovers.
+	td.advance(2 * time.Minute)
+	td.syncRepo(state, true)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.failures != 0 || state.incident != "" || !state.nextAttempt.IsZero() {
+		t.Fatalf("recovery did not reset state: failures=%d incident=%q", state.failures, state.incident)
+	}
+	if got := td.syncer.callCount("notes"); got != 2 {
+		t.Fatalf("notes synced %d times, want 2", got)
 	}
 }

@@ -34,6 +34,7 @@
 - on a rebase conflict it runs `git rebase --abort`, keeps your local commits, and retries later. it never force-pushes and never resolves conflicts.
 - failures retry with backoff: 1 minute, doubling, up to 30 minutes. success resets it.
 - one failing repo never blocks another.
+- each repo runs one sync cycle at a time. a cycle owns its repo until the Git work, the result bookkeeping, the notifications, and the retry decision are all applied. only then can the next cycle for that repo start. different repos sync in parallel.
 - being offline (dns, connection, reset, timeout) is not an incident. it never notifies; it just retries.
 - any other failure notifies once it has lasted 10 minutes, then silence until it recovers. repos that cross that line together share one notification. short blips stay silent.
 - if a file vanishes while staging, or the worktree changes right before the rebase, the cycle is skipped and retried. nothing is committed and no notification is sent.
