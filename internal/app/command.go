@@ -13,6 +13,14 @@ import (
 	"time"
 )
 
+// commandRunner runs a program and returns what it wrote to stdout.
+//
+// Output contract: the returned string is stdout only, so callers can parse it
+// as data (`git status -z`, `rev-parse`, ...). Stderr never mixes into it, not
+// even when the command exits 0 with a warning. On failure the error carries
+// the redacted stderr and stdout so classifiers (offline, push rejected,
+// authentication) keep working. Stderr from a successful command goes to
+// warn, when set, and is otherwise dropped.
 type commandRunner interface {
 	run(ctx context.Context, dir, stdin, name string, args ...string) (string, error)
 }
@@ -20,6 +28,7 @@ type commandRunner interface {
 type execCommandRunner struct {
 	path string
 	env  []string
+	warn func(format string, args ...any) // receives stderr of successful commands; nil drops it
 }
 
 func backgroundRunner() execCommandRunner {
@@ -88,18 +97,21 @@ func (r execCommandRunner) run(ctx context.Context, dir, stdin, name string, arg
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if commandCtx.Err() != nil {
-		return output.String(), fmt.Errorf("%s timed out: %w", name, commandCtx.Err())
+		return stdout.String(), fmt.Errorf("%s timed out: %w", name, commandCtx.Err())
 	}
 	if err != nil {
-		cleanOutput := redactCredentials(strings.TrimSpace(output.String()))
-		return output.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, cleanOutput)
+		diagnostics := redactCredentials(strings.TrimSpace(stderr.String() + "\n" + stdout.String()))
+		return stdout.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, diagnostics)
 	}
-	return output.String(), nil
+	if warning := strings.TrimSpace(stderr.String()); warning != "" && r.warn != nil {
+		r.warn("%s %s: %s", name, strings.Join(args, " "), redactCredentials(warning))
+	}
+	return stdout.String(), nil
 }
 
 func (r execCommandRunner) runInteractive(ctx context.Context, dir string, in io.Reader, out io.Writer, name string, args ...string) error {

@@ -87,7 +87,10 @@ func runDaemon(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	d := newDaemon(ctx, cfg, backgroundRunner(), log.New(os.Stdout, "repo-sync: ", log.LstdFlags))
+	logger := log.New(os.Stdout, "repo-sync: ", log.LstdFlags)
+	runner := backgroundRunner()
+	runner.warn = logger.Printf
+	d := newDaemon(ctx, cfg, runner, logger)
 	d.statusFile = statusPath(configPath)
 	return d.run()
 }
