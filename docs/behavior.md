@@ -39,6 +39,14 @@
 - if a file vanishes while staging, or the worktree changes right before the rebase, the cycle is skipped and retried. nothing is committed and no notification is sent.
 - there is no paused state and no `resume` command. if something cannot be done safely it logs, waits, and tries again.
 
+## missing folders
+
+- if a repo folder is gone (deleted, renamed, or on a disk that is not mounted), only that repo is skipped. every other repo keeps syncing. the service starts even when some or all folders are missing.
+- the repo stays in the config. nothing is removed and no command is needed.
+- a missing folder follows the normal failure rules: retries with backoff, one notification once it has been gone for 10 minutes, then silence.
+- every 10 seconds it checks whether the folder is back. when it is, the repo syncs right away, without a restart or a manual command.
+- a repo that was missing at startup, or that came back, is covered by that 10-second poll rather than file events. edits still sync after the usual quiet period.
+
 ## files
 
 - config: `~/Library/Application Support/repo-sync/config.json`. one json file. edit it by hand if you like, then run `repo-sync setup` again or restart the service.

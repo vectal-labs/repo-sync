@@ -178,3 +178,144 @@ func (w testWriter) Write(p []byte) (int, error) {
 	w.t.Log(strings.TrimRight(string(p), "\n"))
 	return len(p), nil
 }
+
+// TestEndToEndMissingFolderNeverStopsTheService runs the real daemon with one
+// healthy clone and one configured folder that does not exist. The healthy
+// repository must keep syncing, the missing one must resume on its own when
+// its folder appears, and a folder that vanishes mid-run must come back the
+// same way. No restart, no `add`, no manual command.
+func TestEndToEndMissingFolderNeverStopsTheService(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end test")
+	}
+	alphaRemote, alpha := makeGitFixture(t)
+	betaRemote, betaClone := makeGitFixture(t)
+	beta := filepath.Join(t.TempDir(), "beta") // configured, but not there yet
+
+	d, logs, notifications, done, cancel := startDaemon(t, []repoConfig{
+		{Name: "alpha", Path: alpha, Remote: "origin"},
+		{Name: "beta", Path: beta, Remote: "origin"},
+	})
+	waitFor := func(t *testing.T, what string, condition func() bool) {
+		t.Helper()
+		waitForOrStop(t, what, condition, done)
+	}
+	remoteHas := func(remote, file string) bool {
+		return strings.Contains(gitOutput(t, "", "--git-dir", remote, "ls-tree", "-r", "--name-only", "main"), file)
+	}
+
+	// 1. The healthy repository syncs although beta's folder is missing.
+	write(t, alpha, "one.md", "alpha keeps going\n")
+	waitFor(t, "alpha's edit reaches its remote", func() bool { return remoteHas(alphaRemote, "one.md") })
+	waitFor(t, "beta is reported as missing", func() bool {
+		return strings.Contains(logs.String(), "beta sync failed") && d.states["beta"].isUnavailable()
+	})
+
+	// 2. beta's folder appears. It syncs without a restart or a manual command.
+	if err := os.Rename(betaClone, beta); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "beta recovers", func() bool { return strings.Contains(logs.String(), "beta recovered") })
+	write(t, beta, "two.md", "beta is back\n")
+	waitFor(t, "beta's edit reaches its remote", func() bool { return remoteHas(betaRemote, "two.md") })
+
+	// 3. alpha vanishes while running: beta still syncs, alpha resumes on return.
+	away := alpha + ".away"
+	if err := os.Rename(alpha, away); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "alpha is reported as missing", func() bool {
+		return strings.Contains(logs.String(), "alpha sync failed") && d.states["alpha"].isUnavailable()
+	})
+	write(t, beta, "three.md", "beta while alpha is away\n")
+	waitFor(t, "beta syncs while alpha is away", func() bool { return remoteHas(betaRemote, "three.md") })
+	if err := os.Rename(away, alpha); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "alpha recovers", func() bool { return strings.Contains(logs.String(), "alpha recovered") })
+	write(t, alpha, "four.md", "alpha is back\n")
+	waitFor(t, "alpha's edit reaches its remote after returning", func() bool { return remoteHas(alphaRemote, "four.md") })
+
+	// 4. Shutdown is graceful. Short absences never produce a popup.
+	stopDaemon(t, done, cancel)
+	if got := notifications(); len(got) != 0 {
+		t.Fatalf("expected no notifications, got %q", got)
+	}
+}
+
+// TestEndToEndAllFoldersMissingThenOneReturns starts the daemon with nothing
+// to watch at all. It must idle and pick up the first folder that shows up.
+func TestEndToEndAllFoldersMissingThenOneReturns(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end test")
+	}
+	remote, clone := makeGitFixture(t)
+	root := t.TempDir()
+	notes, ideas := filepath.Join(root, "notes"), filepath.Join(root, "ideas")
+
+	_, logs, notifications, done, cancel := startDaemon(t, []repoConfig{
+		{Name: "notes", Path: notes, Remote: "origin"},
+		{Name: "ideas", Path: ideas, Remote: "origin"},
+	})
+	waitForOrStop(t, "both repositories are reported as missing", func() bool {
+		return strings.Contains(logs.String(), "notes sync failed") && strings.Contains(logs.String(), "ideas sync failed")
+	}, done)
+
+	if err := os.Rename(clone, notes); err != nil {
+		t.Fatal(err)
+	}
+	write(t, notes, "hello.md", "first folder to return\n")
+	waitForOrStop(t, "the returned folder syncs", func() bool {
+		return strings.Contains(gitOutput(t, "", "--git-dir", remote, "ls-tree", "-r", "--name-only", "main"), "hello.md")
+	}, done)
+
+	stopDaemon(t, done, cancel)
+	if got := notifications(); len(got) != 0 {
+		t.Fatalf("expected no notifications, got %q", got)
+	}
+}
+
+// startDaemon runs the real daemon on the given repositories with fast timers.
+func startDaemon(t *testing.T, repos []repoConfig) (d *daemon, logs *syncBuffer, notifications func() []string, done chan error, cancel context.CancelFunc) {
+	t.Helper()
+	cfg := config{
+		IdleDebounce:  duration{300 * time.Millisecond},
+		FetchInterval: duration{500 * time.Millisecond},
+		Repositories:  repos,
+	}
+	logs = &syncBuffer{}
+	var mu sync.Mutex
+	var messages []string
+	ctx, cancel := context.WithCancel(context.Background())
+	d = newDaemon(ctx, cfg, execCommandRunner{}, log.New(io.MultiWriter(logs, testWriter{t}), "", log.Ltime))
+	d.healthInterval = 500 * time.Millisecond
+	d.online = func(context.Context) bool { return true }
+	d.notify = func(_ context.Context, _ commandRunner, message string) error {
+		mu.Lock()
+		messages = append(messages, message)
+		mu.Unlock()
+		return nil
+	}
+	done = make(chan error, 1)
+	go func() { done <- d.run() }()
+	t.Cleanup(cancel)
+	notifications = func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), messages...)
+	}
+	return d, logs, notifications, done, cancel
+}
+
+func stopDaemon(t *testing.T, done <-chan error, cancel context.CancelFunc) {
+	t.Helper()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("daemon exited with error: %v", err)
+		}
+	case <-time.After(shutdownGrace + 5*time.Second):
+		t.Fatal("daemon did not stop")
+	}
+}
