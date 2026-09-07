@@ -385,18 +385,76 @@ func TestGitSyncRetriesWhenRemoteMovesDuringPush(t *testing.T) {
 	}
 }
 
+func TestGitSyncReportsPersistentRemoteLockAsFailure(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	write(t, local, "public.txt", "public\n")
+	lock := filepath.Join(remote, "refs", "heads", "main.lock")
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remoteHead := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main"))
+
+	syncer := gitSyncer{runner: execCommandRunner{}}
+	repo := repoConfig{Name: "notes", Path: local, Remote: "origin"}
+	report, err := syncer.sync(context.Background(), repo, true)
+	if err == nil {
+		t.Fatalf("push through a stuck remote lock must fail, report = %+v", report)
+	}
+	var skip *skipError
+	if errors.As(err, &skip) {
+		t.Fatalf("a stuck remote lock is a failure, not a skip: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot lock ref") {
+		t.Fatalf("error must carry Git's reason for the operator: %v", err)
+	}
+	if report.Committed != 1 || report.Pushed {
+		t.Fatalf("report = %+v, want the commit kept locally and nothing pushed", report)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != remoteHead {
+		t.Fatalf("remote main moved to %s while locked", got)
+	}
+
+	// Once the lock is gone the next cycle pushes the kept commit as usual.
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+	report, err = syncer.sync(context.Background(), repo, true)
+	if err != nil || !report.Pushed || report.Committed != 0 {
+		t.Fatalf("after unlock: report = %+v, err = %v", report, err)
+	}
+	if got := gitOutput(t, local, "--git-dir", remote, "show", "main:public.txt"); got != "public\n" {
+		t.Fatalf("remote file = %q", got)
+	}
+}
+
 func TestPushRejected(t *testing.T) {
 	rejected := []string{
-		"git push origin HEAD:main: exit status 1: remote: error: cannot lock ref 'refs/heads/main': is at abc but expected def",
-		"git push: ! [rejected] main -> main (fetch first)",
-		"git push: ! [rejected] main -> main (non-fast-forward)",
+		"git push origin HEAD:main: exit status 1: To github.com:x/y.git\n ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs to 'github.com:x/y.git'",
+		"git push origin HEAD:main: exit status 1: To github.com:x/y.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to 'github.com:x/y.git'",
+		// The remote's own compare-and-swap lost against a concurrent push.
+		"git push origin HEAD:main: exit status 1: remote: error: cannot lock ref 'refs/heads/main': is at 6e8d7f0c9b2a1e3d4c5b6a7f8e9d0c1b2a3f4e5d but expected 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c\nTo github.com:x/y.git\n ! [remote rejected] HEAD -> main (failed to update ref)",
 	}
 	for _, message := range rejected {
 		if !pushRejected(errors.New(message)) {
-			t.Errorf("%q should count as rejected", message)
+			t.Errorf("%q should count as a concurrent push", message)
 		}
 	}
-	if pushRejected(errors.New("git push: could not resolve host: github.com")) {
-		t.Error("network errors are not rejections")
+	notRejected := []string{
+		// A stuck lock file on the remote does not go away by retrying.
+		"git push origin HEAD:main: exit status 1: remote: error: cannot lock ref 'refs/heads/main': Unable to create '/srv/git/notes.git/./refs/heads/main.lock': File exists.\nremote: Another git process seems to be running in this repository\nTo /srv/git/notes.git\n ! [remote rejected] HEAD -> main (failed to update ref)",
+		"git push origin HEAD:main: exit status 1: remote: error: cannot lock ref 'refs/heads/main': Unable to create '/srv/git/notes.git/./refs/heads/main.lock': Permission denied\nTo /srv/git/notes.git\n ! [remote rejected] HEAD -> main (failed to update ref)",
+		"git push origin HEAD:main: exit status 1: remote: no pushes allowed\nTo /srv/git/notes.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)",
+		"git push origin HEAD:main: exit status 1: error: remote unpack failed: unable to create temporary object directory\nTo /srv/git/notes.git\n ! [remote rejected] HEAD -> main (unpacker error)",
+		"git push origin HEAD:main: exit status 128: ERROR: Permission to x/y.git denied to someone.\nfatal: Could not read from remote repository.",
+		"git push origin HEAD:main: exit status 128: fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com",
+		// Reasons quoted inside a path, branch name, or hook message are not proof of a race.
+		"git push origin HEAD:main: exit status 1: remote: error: cannot lock ref 'refs/heads/main': Unable to create '/srv/fetch first/non-fast-forward/refs/heads/main.lock': File exists.\nTo /srv/git/notes.git\n ! [remote rejected] HEAD -> main (failed to update ref)",
+		"git push origin HEAD:non-fast-forward: exit status 1: To /srv/git/notes.git\n ! [remote rejected] HEAD -> non-fast-forward (pre-receive hook declined)",
+		"git push origin HEAD:main: exit status 1: remote: policy: is at odds with branch protection but expected to pass\nTo /srv/git/notes.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)",
+	}
+	for _, message := range notRejected {
+		if pushRejected(errors.New(message)) {
+			t.Errorf("%q must stay a normal failure so it backs off and eventually notifies", message)
+		}
 	}
 }

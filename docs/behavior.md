@@ -32,6 +32,7 @@
 ## conflicts and failures
 
 - on a rebase conflict it runs `git rebase --abort`, keeps your local commits, and retries later. it never force-pushes and never resolves conflicts.
+- if a teammate pushes between the fetch and the push, it fetches, rebases, and pushes once more right away. only Git's own race reasons count: `fetch first`, `non-fast-forward`, or the remote reporting the ref is at one commit but expected another. a stuck remote lock file, a permission error, or a hook refusal is a normal failure: it backs off and notifies like any other error.
 - failures retry with backoff: 1 minute, doubling, up to 30 minutes. success resets it.
 - one failing repo never blocks another.
 - being offline (dns, connection, reset, timeout) is not an incident. it never notifies; it just retries.
