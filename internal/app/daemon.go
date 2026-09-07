@@ -245,11 +245,18 @@ func (s *repoState) beginSync(now time.Time) (ok bool, wait time.Duration) {
 	return true, 0
 }
 
-func (s *repoState) endSync() {
+// endSync releases the repository and, in the same step, arms the follow-up
+// the finished cycle decided on (a retry backoff or a debounce for leftover
+// changes) unless a timer is already pending. Doing both under one lock means
+// no other cycle can slip in between the release and the scheduling decision.
+func (s *repoState) endSync(next time.Duration, callback func()) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.syncing = false
 	s.lastOwnWrite = time.Now()
-	s.mu.Unlock()
+	if next > 0 && s.timer == nil {
+		s.setTimerLocked(next, callback)
+	}
 }
 
 func (s *repoState) isAvailable(now time.Time) bool {
@@ -277,20 +284,26 @@ func (d *daemon) syncRepo(state *repoState, commitLocal bool) {
 	}
 	d.inflight.Add(1)
 	defer d.inflight.Done()
+	// The cycle owns the repository until its result and retry decision are
+	// applied. Releasing right after the Git work let a newer cycle succeed in
+	// between, only to have this cycle's older failure overwrite it.
 	report, err := d.syncer.sync(d.opCtx, state.config, commitLocal)
-	state.endSync()
 	if report.Scanned {
 		d.reportSecrets(state, report.Blocked)
 	}
-	d.handleResult(state, report, err)
-
-	changed, _, statusErr := d.syncer.changes(d.opCtx, state.config)
-	if statusErr == nil && len(changed) > 0 {
-		state.scheduleIfAbsent(d.cfg.IdleDebounce.Duration, func() { d.syncRepo(state, true) })
+	next := d.handleResult(state, report, err)
+	if next == 0 {
+		changed, _, statusErr := d.syncer.changes(d.opCtx, state.config)
+		if statusErr == nil && len(changed) > 0 {
+			next = d.cfg.IdleDebounce.Duration
+		}
 	}
+	state.endSync(next, func() { d.syncRepo(state, true) })
 }
 
-func (d *daemon) handleResult(state *repoState, report syncReport, err error) {
+// handleResult applies the cycle's outcome and returns the retry backoff, or
+// zero when the repository may sync again as soon as there is work.
+func (d *daemon) handleResult(state *repoState, report syncReport, err error) time.Duration {
 	name := state.config.Name
 	if err == nil {
 		state.mu.Lock()
@@ -307,7 +320,7 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) {
 		if summary := report.String(); summary != "" {
 			d.logger.Printf("%s: %s", name, summary)
 		}
-		return
+		return 0
 	}
 
 	var skip *skipError
@@ -322,7 +335,7 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) {
 		if skip.offBranch {
 			d.noteOffBranch(state, skip.reason)
 		}
-		return
+		return 0
 	}
 
 	now := d.now()
@@ -343,10 +356,10 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) {
 	}
 	state.mu.Unlock()
 	d.logger.Printf("%s sync failed (retry in %s): %v", name, delay.Round(time.Second), err)
-	state.scheduleIfAbsent(delay, func() { d.syncRepo(state, true) })
 	if alert {
 		d.alerts.add(name, err)
 	}
+	return delay
 }
 
 func backoffDelay(failures int) time.Duration {
