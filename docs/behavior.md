@@ -28,6 +28,7 @@
 ## syncing
 
 - after 60 seconds without local edits, repo-sync commits every non-ignored change, including files you already staged. the commit message lists the files.
+- staged renames and deletions (`git mv`, `git rm`) sync like any other change, with no manual commit needed. the old path disappears from the remote and the renamed contents are kept, including edits made after the rename.
 - it rebases on top of the remote, then pushes. every 60 seconds it also fetches and pulls what teammates pushed.
 - it syncs again right after wake and when the network comes back.
 - both intervals are in the config file.
@@ -46,6 +47,8 @@
 - allowed: `.env.example`, `.env.sample`, `.env.template`, `.env.dist`.
 - a blocked file is left out. everything else still syncs. you get one notification per file.
 - a blocked file you staged by hand is unstaged so it never reaches the remote.
+- deleting a tracked blocked file with `git rm`, or renaming it to a safe name with `git mv`, syncs like any other change. a deletion publishes nothing.
+- `git rm --cached` plus a `.gitignore` entry stops tracking a file but keeps it on disk. the deletion syncs when the remote has not moved. if teammates pushed meanwhile, the rebase would overwrite the ignored copy, so repo-sync refuses it, keeps the file untouched, and reports the failure until you move the file aside.
 - `repo-sync allow <file>` inside the repo overrides the guard for that file. the list is in [`internal/app/secrets.go`](../internal/app/secrets.go).
 
 ## conflicts and failures
