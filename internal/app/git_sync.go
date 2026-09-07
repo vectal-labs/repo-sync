@@ -28,6 +28,11 @@ type change struct {
 func (c change) tracked() bool { return c.code != "??" }
 func (c change) staged() bool  { return c.tracked() && c.code[0] != ' ' }
 
+// deleted reports a plain staged deletion: the path left the index and
+// nothing took its place in the worktree. `DA` (deleted, then recreated with
+// intent-to-add) is a modification, not a deletion.
+func (c change) deleted() bool { return c.code == "D " }
+
 type syncReport struct {
 	Scanned   bool     // the worktree was inspected; Blocked is meaningful
 	Blocked   []string // secret paths left out of the commit
@@ -132,16 +137,7 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 		}
 		remoteAfter, _ := s.revParse(ctx, repo.Path, remoteRef)
 		report.Pulled = remoteAfter != remoteBefore
-		if _, err := runGit(ctx, s.runner, repo.Path, "rebase", remoteRef); err != nil {
-			if s.rebaseInProgress(ctx, repo.Path) {
-				_, _ = runGit(ctx, s.runner, repo.Path, "rebase", "--abort")
-				return report, &skipError{reason: "rebase conflict with " + remoteRef + "; rebase aborted, will retry"}
-			}
-			// A file changed between our clean check and the rebase. Nothing is
-			// broken; the next cycle simply commits it first.
-			if strings.Contains(err.Error(), "cannot rebase:") {
-				return report, &skipError{reason: "worktree changed before rebase; will retry"}
-			}
+		if err := s.rebase(ctx, repo.Path, remoteRef); err != nil {
 			return report, err
 		}
 		head, err := s.revParse(ctx, repo.Path, "HEAD")
@@ -306,6 +302,77 @@ func unpublishedSubmodules(err error) []string {
 	return paths
 }
 
+// rebase replays the local commits on top of remoteRef and aborts on conflict.
+//
+// Git starts a rebase by checking out remoteRef. It refuses to overwrite an
+// untracked file, but silently overwrites an ignored one. A file the user
+// untracked but kept on disk (`git rm --cached .env` plus a .gitignore entry)
+// would be replaced by the remote's copy and then deleted when the local
+// deletion replays or the rebase aborts. Nothing can put such a file back
+// safely afterwards (an editor may have written newer contents meanwhile), so
+// the rebase is refused instead and the repository waits for the user.
+func (s gitSyncer) rebase(ctx context.Context, path, remoteRef string) error {
+	if file, err := s.ignoredFileInTheWay(ctx, path, remoteRef); err != nil {
+		return err
+	} else if file != "" {
+		return fmt.Errorf("ignored file %s would be overwritten by rebasing onto %s; move it aside until the repository has synced", file, remoteRef)
+	}
+	_, err := runGit(ctx, s.runner, path, "rebase", remoteRef)
+	if err == nil {
+		return nil
+	}
+	if s.rebaseInProgress(ctx, path) {
+		_, _ = runGit(ctx, s.runner, path, "rebase", "--abort")
+		return &skipError{reason: "rebase conflict with " + remoteRef + "; rebase aborted, will retry"}
+	}
+	// A file changed between our clean check and the rebase. Nothing is
+	// broken; the next cycle simply commits it first.
+	if strings.Contains(err.Error(), "cannot rebase:") {
+		return &skipError{reason: "worktree changed before rebase; will retry"}
+	}
+	return err
+}
+
+// ignoredFileInTheWay returns an ignored file that the rebase's checkout of
+// remoteRef would overwrite: it exists on disk at a path remoteRef has and
+// HEAD does not. When remoteRef is already part of HEAD's history the rebase
+// checks nothing out, so there is nothing in the way.
+func (s gitSyncer) ignoredFileInTheWay(ctx context.Context, path, remoteRef string) (string, error) {
+	remoteHead, err := s.revParse(ctx, path, remoteRef)
+	if err != nil {
+		return "", err
+	}
+	base, err := runGit(ctx, s.runner, path, "merge-base", "HEAD", remoteRef)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(base) == remoteHead {
+		return "", nil
+	}
+	output, err := runGit(ctx, s.runner, path, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", "HEAD", remoteRef)
+	if err != nil {
+		return "", err
+	}
+	var present []string
+	for _, name := range splitNUL(output) {
+		if _, err := os.Lstat(filepath.Join(path, name)); err == nil {
+			present = append(present, name)
+		}
+	}
+	if len(present) == 0 {
+		return "", nil
+	}
+	args := append([]string{"--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--"}, present...)
+	output, err = runGit(ctx, s.runner, path, args...)
+	if err != nil {
+		return "", err
+	}
+	if ignored := splitNUL(output); len(ignored) > 0 {
+		return ignored[0], nil
+	}
+	return "", nil
+}
+
 // Push rejections Git reports when the remote branch moved after our fetch.
 // The reason sits in parentheses at the end of a "[rejected]" line ("stale
 // info" is our own lease finding the destination elsewhere than validated),
@@ -364,7 +431,10 @@ func (s gitSyncer) defaultBranch(ctx context.Context, repo repoConfig) string {
 }
 
 // changes returns the syncable changes and, separately, the secret-guarded
-// ones. Files that are already ignored by Git never appear.
+// ones. Files that are already ignored by Git never appear. A staged deletion
+// of a secret path (`git rm .env`, or the old path of `git mv .env notes.txt`)
+// is syncable: it publishes nothing, and holding it back would leave the
+// repository stuck behind a tracked secret that no longer exists on disk.
 func (s gitSyncer) changes(ctx context.Context, repo repoConfig) ([]change, []change, error) {
 	output, err := runGit(ctx, s.runner, repo.Path, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
@@ -372,7 +442,7 @@ func (s gitSyncer) changes(ctx context.Context, repo repoConfig) ([]change, []ch
 	}
 	var allowed, blocked []change
 	for _, entry := range parseStatus(output) {
-		if isSecretPath(entry.path, repo.Allow) {
+		if isSecretPath(entry.path, repo.Allow) && !entry.deleted() {
 			blocked = append(blocked, entry)
 		} else {
 			allowed = append(allowed, entry)
@@ -382,7 +452,9 @@ func (s gitSyncer) changes(ctx context.Context, repo repoConfig) ([]change, []ch
 }
 
 // parseStatus reads `git status --porcelain=v1 -z`. Renames and copies carry a
-// second NUL-terminated field with the original path, which counts as deleted.
+// second NUL-terminated field with the original path. For a rename that path
+// is a deletion in the same column (staged for `R `, worktree-only for ` R`);
+// a copy leaves its original untouched.
 func parseStatus(output string) []change {
 	fields := strings.Split(output, "\x00")
 	var result []change
@@ -393,8 +465,14 @@ func parseStatus(output string) []change {
 		}
 		code, file := field[:2], field[3:]
 		result = append(result, change{code: code, path: file})
-		if (code[0] == 'R' || code[0] == 'C') && i+1 < len(fields) && fields[i+1] != "" {
-			i++
+		if !strings.ContainsAny(code, "RC") || i+1 >= len(fields) || fields[i+1] == "" {
+			continue
+		}
+		i++
+		switch {
+		case code[0] == 'R':
+			result = append(result, change{code: "D ", path: fields[i]})
+		case code[1] == 'R':
 			result = append(result, change{code: " D", path: fields[i]})
 		}
 	}
@@ -418,16 +496,26 @@ func (s gitSyncer) commit(ctx context.Context, repo repoConfig, changed []change
 	}
 	var spec strings.Builder
 	for _, entry := range changed {
+		// A staged deletion, including the old path of a staged rename, has
+		// already left the index and the worktree. There is nothing to add
+		// for it, and `git add` would reject the missing path.
+		if entry.deleted() {
+			continue
+		}
 		spec.WriteString(entry.path)
 		spec.WriteByte(0)
 	}
-	if _, err := s.runner.run(ctx, path, spec.String(), "git", "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
-		// A file listed by status vanished before add saw it (editors and
-		// agents create and delete files quickly). Retry from a fresh status.
-		if strings.Contains(err.Error(), "did not match any files") {
-			return 0, &skipError{reason: "files changed while staging; will retry"}
+	// With an empty pathspec `git add -A` would stage the whole worktree,
+	// including files the guard just unstaged. Staged-only changes need no add.
+	if spec.Len() > 0 {
+		if _, err := s.runner.run(ctx, path, spec.String(), "git", "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
+			// A file listed by status vanished before add saw it (editors and
+			// agents create and delete files quickly). Retry from a fresh status.
+			if strings.Contains(err.Error(), "did not match any files") {
+				return 0, &skipError{reason: "files changed while staging; will retry"}
+			}
+			return 0, err
 		}
-		return 0, err
 	}
 	output, err := runGit(ctx, s.runner, path, "diff", "--cached", "--name-only", "-z")
 	if err != nil {

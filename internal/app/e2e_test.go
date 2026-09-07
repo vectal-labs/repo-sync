@@ -443,3 +443,62 @@ func stopDaemon(t *testing.T, done <-chan error, cancel context.CancelFunc) {
 		t.Fatal("daemon did not stop")
 	}
 }
+
+// TestEndToEndUntrackedIgnoredFileSurvivesSync runs the real daemon after a
+// user untracks a secret but keeps it on disk and ignored. Root and nested
+// paths, an unrelated remote edit and a conflicting one: the daemon must
+// refuse the rebase, report a failure, keep running, and never touch or
+// publish the retained copy.
+func TestEndToEndUntrackedIgnoredFileSurvivesSync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end test")
+	}
+	for _, test := range []struct {
+		name       string
+		file       string
+		remoteFile string
+	}{
+		{"unrelated remote edit", ".env", "teammate.txt"},
+		{"conflicting remote edit", ".env", ".env"},
+		{"nested path", "config/.env", "teammate.txt"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			remote, local := makeGitFixture(t)
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(local, test.file)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeAndCommit(t, local, test.file, "old\n", "tracked baseline")
+			gitRun(t, local, "push", "-q", "origin", "main")
+			other := filepath.Join(t.TempDir(), "other")
+			gitRun(t, "", "clone", "-q", remote, other)
+			configureGitUser(t, other)
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(other, test.remoteFile)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeAndCommit(t, other, test.remoteFile, "remote\n", "remote edit")
+			gitRun(t, other, "push", "-q", "origin", "main")
+			remoteBefore := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main"))
+
+			gitRun(t, local, "rm", "-q", "--cached", test.file)
+			want := "kept locally, never committed\n"
+			write(t, local, test.file, want)
+			write(t, local, ".gitignore", test.file+"\n")
+
+			_, logs, _, done, cancel := startDaemon(t, []repoConfig{{Name: "notes", Path: local, Remote: "origin"}})
+			waitForOrStop(t, "daemon refuses the rebase", func() bool {
+				return strings.Contains(logs.String(), "sync failed") && strings.Contains(logs.String(), "ignored file "+test.file+" would be overwritten")
+			}, done)
+			stopDaemon(t, done, cancel)
+
+			if got, err := os.ReadFile(filepath.Join(local, test.file)); err != nil || string(got) != want {
+				t.Fatalf("daemon removed or altered the retained file: %q, %v", got, err)
+			}
+			if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != remoteBefore {
+				t.Fatalf("remote main moved to %s; nothing may be pushed", got)
+			}
+			if got := gitOutput(t, local, "status", "--porcelain"); got != "" {
+				t.Fatalf("status = %q, want clean", got)
+			}
+		})
+	}
+}
