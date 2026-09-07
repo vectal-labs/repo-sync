@@ -6,6 +6,8 @@ you edit. after 60 seconds of quiet, repo-sync commits, pulls, and pushes. it st
 
 for notes, docs, config, and small team repos. macos only.
 
+![three teammates editing notes, docs, and team context, kept up to date by repo-sync and github](docs/team-sync.png)
+
 ## install
 
 ```sh
