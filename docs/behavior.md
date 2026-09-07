@@ -2,9 +2,25 @@
 
 ## setup
 
-- before writing the config or installing the service, setup verifies that background Git can fetch every configured repository without a terminal prompt.
-- for GitHub HTTPS repositories with missing credentials, setup uses GitHub CLI to configure Git. if needed, it starts the browser login and retries the checks.
-- stale global Git TLS-version pins are ignored. if authentication, TLS, or repository access still fails, setup stops before changing the config or service and reports the failing repositories.
+- setup explains automatic commits, finds repositories (including folders with just 1 repo), and lets you select repos or enter a path. nothing is preselected. rerunning setup keeps existing repositories.
+- before changing config or service files, setup checks Git identity, noninteractive fetch access, and push access with a dry run for every configured repo. these checks use the background service's `PATH`.
+- a push dry run does not upload commits. server hooks and branch protection can still reject a real push later.
+- GitHub HTTPS credential repair uses GitHub CLI only when needed. Homebrew installs Git and `gh`; other installations get clear instructions if a required tool is missing.
+- stale global Git TLS-version pins are ignored. if a check fails, setup reports the repo and stops before installing.
+- setup starts the service and checks that it stays running. `--no-launch` writes the files without starting or verifying the service.
+
+## status and upgrades
+
+- `repo-sync status` checks the service and reports repository health. a service failure or a repo retrying after an error returns a nonzero exit code. it does not commit or push changes. pass `--config /path/to/config.json` for custom settings.
+- `brew upgrade --cask repo-sync` preserves settings and logs. if a service plist already exists, the install hook updates its binary path and reloads it. it never opens interactive setup.
+- after an upgrade, run `repo-sync status` to check readiness. for a Go installation, install the new binary and rerun `repo-sync setup`.
+
+## uninstall
+
+- `repo-sync uninstall` asks for confirmation, stops the service, and removes its plist, settings, logs, cache, and installed binary. Homebrew installations are removed through Homebrew.
+- use `--yes` for noninteractive removal or `--keep-binary` to retain the executable. use `--config /path/to/config.json` for a custom config.
+- repositories, Git history, shared Git credentials, Git, and GitHub CLI are preserved.
+- `brew uninstall --cask repo-sync` stops the service but retains user files. add `--zap` to remove the standard settings, logs, cache, and plist too. Homebrew moves these files to the trash.
 
 ## syncing
 
@@ -43,6 +59,7 @@
 
 - config: `~/Library/Application Support/repo-sync/config.json`. one json file. edit it by hand if you like, then run `repo-sync setup` again or restart the service.
 - logs: `~/Library/Logs/repo-sync/`.
+- runtime status: `~/Library/Caches/repo-sync/`. kept separate from custom config files so health updates do not change your repos.
 - service: `~/Library/LaunchAgents/com.vectal-labs.repo-sync.plist`. it starts at login and restarts on crash.
 
 ## development
@@ -53,4 +70,4 @@ go vet ./...
 go test -race ./...
 ```
 
-the tests spin up real git remotes and clones in temp folders. the end to end test runs the actual daemon. decisions are in `docs/adr/`.
+the tests spin up real git remotes and clones in temp folders. the end to end test runs the actual daemon. see [installation checks](install-testing.md) for release validation. decisions are in `docs/adr/`.

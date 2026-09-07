@@ -19,6 +19,10 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test -race -count=1 ./...
+      - run: ruby scripts/test-cask.rb
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          args: check --config .github/.goreleaser.yaml
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

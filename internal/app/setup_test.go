@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -48,7 +49,7 @@ func TestRunSetupIsRepeatableAndKeepsExistingConfig(t *testing.T) {
 		gitRun(t, path, "push", "-q", "-u", "origin", "main")
 	}
 	configPath := filepath.Join(home, "Library", "Application Support", "repo-sync", "config.json")
-	opts := setupOptions{configPath: configPath, binary: "/usr/local/bin/repo-sync", noLaunch: true}
+	opts := setupOptions{configPath: configPath, binary: "/usr/local/bin/repo-sync", noLaunch: true, runner: execCommandRunner{}}
 
 	var out strings.Builder
 	opts.in, opts.out = strings.NewReader("2\n"), &out
@@ -116,6 +117,7 @@ func TestRunSetupRejectsRepoThatDaemonCannotFetch(t *testing.T) {
 		configPath: configPath,
 		binary:     "/usr/local/bin/repo-sync",
 		noLaunch:   true,
+		runner:     execCommandRunner{},
 		in:         strings.NewReader("1\n"),
 		out:        &out,
 	})
@@ -141,6 +143,20 @@ type authRepairRunner struct {
 
 func (r *authRepairRunner) run(_ context.Context, _, _, name string, args ...string) (string, error) {
 	r.calls = append(r.calls, name+" "+strings.Join(args, " "))
+	if name == "git" {
+		switch {
+		case slices.Equal(args, []string{"config", "--get", "user.name"}):
+			return "repo-sync test\n", nil
+		case slices.Equal(args, []string{"config", "--get", "user.email"}):
+			return "repo-sync@example.invalid\n", nil
+		case slices.Equal(args, []string{"var", "GIT_AUTHOR_IDENT"}), slices.Equal(args, []string{"var", "GIT_COMMITTER_IDENT"}):
+			return "repo-sync test <repo-sync@example.invalid> 0 +0000\n", nil
+		case slices.Equal(args, []string{"symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"}):
+			return "origin/main\n", nil
+		case slices.Equal(args, []string{"push", "--dry-run", "--no-verify", "--porcelain", "origin", "refs/heads/main:refs/heads/main"}):
+			return "Everything up-to-date\n", nil
+		}
+	}
 	if name == "git" && len(args) >= 3 && args[0] == "remote" && args[1] == "get-url" {
 		return "https://github.com/acme/notes.git\n", nil
 	}

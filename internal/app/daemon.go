@@ -35,7 +35,8 @@ type repoState struct {
 	nextAttempt    time.Time
 	incident       string // non-empty while a failure incident is open
 	incidentSince  time.Time
-	incidentNoted  bool   // the open incident has already produced a popup
+	incidentNoted  bool // the open incident has already produced a popup
+	lastSuccess    time.Time
 	lastSkip       string // last skip reason logged, to avoid repeating it
 	offBranchSince time.Time
 	offBranchNoted bool
@@ -55,6 +56,7 @@ type daemon struct {
 	online func(context.Context) bool
 	alerts *failureAlerts
 
+	statusFile     string
 	healthInterval time.Duration
 	inflight       sync.WaitGroup
 }
@@ -85,7 +87,8 @@ func runDaemon(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	d := newDaemon(ctx, cfg, execCommandRunner{}, log.New(os.Stdout, "repo-sync: ", log.LstdFlags))
+	d := newDaemon(ctx, cfg, backgroundRunner(), log.New(os.Stdout, "repo-sync: ", log.LstdFlags))
+	d.statusFile = statusPath(configPath)
 	return d.run()
 }
 
@@ -122,6 +125,17 @@ func (d *daemon) run() error {
 		go d.consumeEvents(stream.Events)
 	}
 	d.logger.Printf("watching %d repositories", len(d.states))
+	if err := d.publishStatus(); err != nil {
+		return fmt.Errorf("write service readiness: %w", err)
+	}
+	statusDone := make(chan struct{})
+	go d.statusLoop(statusDone)
+	defer func() {
+		<-statusDone
+		if d.statusFile != "" {
+			_ = os.Remove(d.statusFile)
+		}
+	}()
 
 	go d.periodicRemoteSync()
 	go d.healthLoop()
@@ -284,6 +298,7 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) {
 		state.failures, state.incident, state.nextAttempt = 0, "", time.Time{}
 		state.incidentSince, state.incidentNoted = time.Time{}, false
 		state.lastSkip = ""
+		state.lastSuccess = d.now()
 		state.offBranchSince, state.offBranchNoted = time.Time{}, false
 		state.mu.Unlock()
 		if recovered {

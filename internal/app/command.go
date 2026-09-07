@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -15,7 +17,56 @@ type commandRunner interface {
 	run(ctx context.Context, dir, stdin, name string, args ...string) (string, error)
 }
 
-type execCommandRunner struct{}
+type execCommandRunner struct {
+	path string
+	env  []string
+}
+
+func backgroundRunner() execCommandRunner {
+	home, _ := os.UserHomeDir()
+	env := []string{"HOME=" + home, "PATH=" + servicePATH, "TMPDIR=" + os.TempDir(), "LC_ALL=C"}
+	for _, key := range []string{"USER", "LOGNAME"} {
+		if value := os.Getenv(key); value != "" {
+			env = append(env, key+"="+value)
+		}
+	}
+	// Use launchd's agent socket in both preflight and the daemon. A shell may
+	// point at an agent which will not exist after logout or reboot.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if socket, err := exec.CommandContext(ctx, "/bin/launchctl", "getenv", "SSH_AUTH_SOCK").Output(); err == nil && strings.TrimSpace(string(socket)) != "" {
+		env = append(env, "SSH_AUTH_SOCK="+strings.TrimSpace(string(socket)))
+	}
+	return execCommandRunner{path: servicePATH, env: env}
+}
+
+func (r execCommandRunner) command(ctx context.Context, name string, args ...string) *exec.Cmd {
+	if r.path != "" && !strings.ContainsRune(name, '/') {
+		// LookPath otherwise searches the caller's shell PATH, not cmd.Env.
+		found := false
+		for _, dir := range filepath.SplitList(r.path) {
+			candidate := filepath.Join(dir, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+				name, found = candidate, true
+				break
+			}
+		}
+		if !found {
+			name = "/nonexistent-repo-sync-tool/" + name
+		}
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	if r.env != nil {
+		cmd.Env = append([]string(nil), r.env...)
+	}
+	if r.path != "" {
+		cmd.Env = append(cmd.Environ(), "PATH="+r.path)
+	}
+	if filepath.Base(name) == "brew" && len(args) > 0 && args[0] == "uninstall" {
+		cmd.Env = append(cmd.Environ(), "HOMEBREW_NO_AUTOREMOVE=1")
+	}
+	return cmd
+}
 
 type interactiveCommandRunner interface {
 	runInteractive(ctx context.Context, dir string, in io.Reader, out io.Writer, name string, args ...string) error
@@ -26,10 +77,10 @@ var (
 	querySecret    = regexp.MustCompile(`(?i)(token|access_token|password)=[^&\s]+`)
 )
 
-func (execCommandRunner) run(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
+func (r execCommandRunner) run(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
 	commandCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(commandCtx, name, args...)
+	cmd := r.command(commandCtx, name, args...)
 	cmd.Dir = dir
 	// repo-sync is unattended. Never let Git wait for a terminal prompt, and
 	// ignore stale global TLS pins so Git can negotiate its secure default.
@@ -51,8 +102,8 @@ func (execCommandRunner) run(ctx context.Context, dir, stdin, name string, args 
 	return output.String(), nil
 }
 
-func (execCommandRunner) runInteractive(ctx context.Context, dir string, in io.Reader, out io.Writer, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
+func (r execCommandRunner) runInteractive(ctx context.Context, dir string, in io.Reader, out io.Writer, name string, args ...string) error {
+	cmd := r.command(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Stdin = in
 	cmd.Stdout = out

@@ -1,16 +1,16 @@
 package app
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
+	"time"
 )
 
 const launchAgentLabel = "com.vectal-labs.repo-sync"
@@ -22,6 +22,7 @@ type setupOptions struct {
 	in         io.Reader
 	out        io.Writer
 	runner     commandRunner
+	service    *launchService
 }
 
 func runSetup(ctx context.Context, opts setupOptions) error {
@@ -29,20 +30,38 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	if err != nil {
 		return err
 	}
+	if !filepath.IsAbs(opts.configPath) {
+		opts.configPath, err = filepath.Abs(opts.configPath)
+		if err != nil {
+			return err
+		}
+	}
 	runner := opts.runner
 	if runner == nil {
-		runner = execCommandRunner{}
+		runner = backgroundRunner()
+	}
+	service := opts.service
+	if service == nil {
+		service = defaultService()
+	}
+	fmt.Fprintln(opts.out, "1/4 Checking tools")
+	if err := checkGitTools(ctx, runner); err != nil {
+		return err
 	}
 	cfg, err := loadOrDefaultConfig(opts.configPath)
 	if err != nil {
 		return fmt.Errorf("read existing config: %w", err)
 	}
-	fmt.Fprintf(opts.out, "Scanning %s for repositories...\n", home)
-	groups, singles, err := discoverRepos(ctx, runner, home)
+	fmt.Fprintln(opts.out, "\n2/4 Choose repositories")
+	fmt.Fprintf(opts.out, "After %s without edits, repo-sync commits, pulls, and pushes on each repo's default branch.\n", cfg.IdleDebounce)
+	fmt.Fprintln(opts.out, "This includes staged changes. Secret filenames are blocked; file contents are not scanned.")
+	fmt.Fprintf(opts.out, "Scanning %s...\n", home)
+	groups, _, err := discoverRepos(ctx, runner, home)
 	if err != nil {
 		return fmt.Errorf("discover repositories: %w", err)
 	}
-	selected, err := selectRepos(opts.in, opts.out, groups, cfg)
+	input := bufio.NewReader(opts.in)
+	selected, err := selectRepos(input, opts.out, groups, cfg)
 	if err != nil {
 		return err
 	}
@@ -51,144 +70,81 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 			return err
 		}
 	}
-	if err := verifyRepositories(ctx, runner, cfg.Repositories, opts.in, opts.out); err != nil {
-		return err
-	}
-	if err := writeConfig(opts.configPath, cfg); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-	if len(singles) > 0 {
-		fmt.Fprintf(opts.out, "\n%d repositories sit alone in their folder and were not listed. Add one any time with `repo-sync add /path/to/repo`.\n", len(singles))
-	}
-
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
-	logDir := filepath.Join(home, "Library", "Logs", "repo-sync")
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return err
-	}
-	plist := launchAgentPlist(opts.binary, opts.configPath, logDir)
-	if err := writeFileAtomic(plistPath, []byte(plist), 0o644); err != nil {
-		return fmt.Errorf("write LaunchAgent: %w", err)
-	}
-	if !opts.noLaunch {
-		if err := loadLaunchAgent(plistPath); err != nil {
-			return err
-		}
-	}
-	fmt.Fprintf(opts.out, "\nSyncing %d repositories.\nConfig: %s\nLaunchAgent: %s\nLogs: %s\n",
-		len(cfg.Repositories), opts.configPath, plistPath, logDir)
-	return nil
-}
-
-type repoAccessCheck struct {
-	remoteURL string
-	err       error
-}
-
-// verifyRepositories proves that every configured repository can fetch in the
-// same non-interactive environment used by the daemon. GitHub HTTPS credentials
-// are repaired through GitHub CLI when possible, then checked again.
-func verifyRepositories(ctx context.Context, runner commandRunner, repos []repoConfig, in io.Reader, out io.Writer) error {
-	if len(repos) == 0 {
+	if len(cfg.Repositories) == 0 {
+		fmt.Fprintln(opts.out, "\nNo repositories selected. Setup made no changes. Run `repo-sync setup` when you are ready.")
 		return nil
 	}
-	fmt.Fprintf(out, "\nChecking background Git access for %d repositories...\n", len(repos))
-	checks := checkRepositories(ctx, runner, repos)
-
-	needsGitHubAuth := false
-	for _, check := range checks {
-		if check.err != nil && isGitHubHTTPS(check.remoteURL) && isAuthenticationFailure(check.err) {
-			needsGitHubAuth = true
-			break
-		}
+	fmt.Fprintln(opts.out, "\n3/4 Verify Git access")
+	if err := verifyRepositories(ctx, runner, cfg.Repositories, input, opts.out); err != nil {
+		return err
 	}
-	if needsGitHubAuth {
-		if err := configureGitHubCredentials(ctx, runner, in, out); err != nil {
+	plistPath := service.plistPath(home)
+	logDir := filepath.Join(home, "Library", "Logs", "repo-sync")
+	if opts.noLaunch {
+		fmt.Fprintln(opts.out, "\n4/4 Save service files")
+	} else {
+		fmt.Fprintln(opts.out, "\n4/4 Start the background service")
+	}
+	// Preserve the previous installation if writing or loading the new one fails.
+	previousConfig, err := snapshotFile(opts.configPath)
+	if err != nil {
+		return err
+	}
+	previousPlist, err := snapshotFile(plistPath)
+	if err != nil {
+		return err
+	}
+	wasLoaded := false
+	if !opts.noLaunch {
+		prior, err := service.inspect(ctx)
+		if err != nil {
 			return err
 		}
-		checks = checkRepositories(ctx, runner, repos)
+		wasLoaded = prior.loaded
 	}
-
-	var failures []string
-	for i, check := range checks {
-		if check.err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", repos[i].Name, check.err))
-		}
-	}
-	if len(failures) > 0 {
-		return fmt.Errorf("background Git access failed; config and service were not changed:\n- %s", strings.Join(failures, "\n- "))
-	}
-	fmt.Fprintln(out, "Background Git access verified.")
-	return nil
-}
-
-func checkRepositories(ctx context.Context, runner commandRunner, repos []repoConfig) []repoAccessCheck {
-	checks := make([]repoAccessCheck, len(repos))
-	var wg sync.WaitGroup
-	for i := range repos {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			repo := repos[i]
-			remoteURL, err := runGit(ctx, runner, repo.Path, "remote", "get-url", repo.Remote)
-			checks[i].remoteURL = strings.TrimSpace(remoteURL)
-			if err != nil {
-				checks[i].err = err
-				return
+	rollback := func(cause error) error {
+		var restoreErrors []error
+		if !opts.noLaunch {
+			if err := service.stop(ctx); err != nil {
+				return fmt.Errorf("%w; cannot restore files while the new service may still be running: %v", cause, err)
 			}
-			_, checks[i].err = runGit(ctx, runner, repo.Path, "fetch", "--dry-run", repo.Remote)
-		}()
+		}
+		restoreErrors = append(restoreErrors, previousConfig.restore(opts.configPath), previousPlist.restore(plistPath))
+		if wasLoaded {
+			restoreErrors = append(restoreErrors, service.start(ctx, plistPath))
+		}
+		if restoreErr := errors.Join(restoreErrors...); restoreErr != nil {
+			return fmt.Errorf("%w; restoring previous setup also failed: %v", cause, restoreErr)
+		}
+		return fmt.Errorf("%w; previous setup restored", cause)
 	}
-	wg.Wait()
-	return checks
-}
-
-func isGitHubHTTPS(remote string) bool {
-	rest, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(remote)), "https://")
-	if !ok {
-		return false
-	}
-	authority, _, _ := strings.Cut(rest, "/")
-	if at := strings.LastIndex(authority, "@"); at >= 0 {
-		authority = authority[at+1:]
-	}
-	host, _, _ := strings.Cut(authority, ":")
-	return host == "github.com"
-}
-
-func isAuthenticationFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"authentication failed", "could not read username", "could not read password",
-		"terminal prompts disabled", "invalid username or token", "returned error: 401",
-	} {
-		if strings.Contains(message, marker) {
-			return true
+	if !opts.noLaunch {
+		if err := service.stop(ctx); err != nil {
+			return err
 		}
 	}
-	return false
-}
-
-func configureGitHubCredentials(ctx context.Context, runner commandRunner, in io.Reader, out io.Writer) error {
-	fmt.Fprintln(out, "GitHub credentials are not available to background Git. Configuring them with GitHub CLI...")
-	if _, err := runner.run(ctx, "", "", "gh", "auth", "status", "--hostname", "github.com"); err != nil {
-		fmt.Fprintln(out, "GitHub login is required. Follow the browser prompt.")
-		var loginErr error
-		if interactive, ok := runner.(interactiveCommandRunner); ok {
-			loginErr = interactive.runInteractive(ctx, "", in, out, "gh", "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web")
-		} else {
-			_, loginErr = runner.run(ctx, "", "", "gh", "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web")
-		}
-		if loginErr != nil {
-			return fmt.Errorf("GitHub login failed; install GitHub CLI or run `gh auth login --git-protocol https`, then run setup again: %w", loginErr)
-		}
+	if err := writeConfig(opts.configPath, cfg); err != nil {
+		return rollback(err)
 	}
-	if _, err := runner.run(ctx, "", "", "gh", "auth", "setup-git", "--hostname", "github.com"); err != nil {
-		return fmt.Errorf("configure GitHub credentials for Git: %w", err)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return rollback(err)
 	}
+	plist := strings.ReplaceAll(launchAgentPlist(opts.binary, opts.configPath, logDir), launchAgentLabel, service.label)
+	if err := writeFileAtomic(plistPath, []byte(plist), 0o644); err != nil {
+		return rollback(err)
+	}
+	if opts.noLaunch {
+		fmt.Fprintln(opts.out, "Files saved. The service was not started (--no-launch).")
+	} else {
+		if err := service.start(ctx, plistPath); err != nil {
+			return rollback(err)
+		}
+		if err := service.waitReady(ctx, opts.configPath, 15*time.Second); err != nil {
+			return rollback(err)
+		}
+		fmt.Fprintf(opts.out, "Service is running with %d repositories. Starts automatically at login.\n", len(cfg.Repositories))
+	}
+	fmt.Fprintf(opts.out, "Config: %s\nLogs: %s\nCheck progress: %s\nRemove: %s\n", opts.configPath, logDir, configCommand("status", opts.configPath), configCommand("uninstall", opts.configPath))
 	return nil
 }
 
@@ -205,30 +161,9 @@ func executablePath() (string, error) {
 	return path, nil
 }
 
-func launchdDomain() string {
-	return "gui/" + strconv.Itoa(os.Getuid())
-}
-
-func loadLaunchAgent(plistPath string) error {
-	_ = exec.Command("launchctl", "bootout", launchdDomain(), plistPath).Run()
-	if output, err := exec.Command("launchctl", "bootstrap", launchdDomain(), plistPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("load LaunchAgent: %w: %s", err, output)
-	}
-	return nil
-}
-
-// restartDaemon asks launchd to restart the service so config changes apply.
-// It is best effort: the caller prints a hint when the service is not loaded.
-func restartDaemon() error {
-	output, err := exec.Command("launchctl", "kickstart", "-k", launchdDomain()+"/"+launchAgentLabel).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
-}
-
 func launchAgentPlist(binary, configPath, logDir string) string {
 	escape := html.EscapeString
+	home, _ := os.UserHomeDir()
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -246,12 +181,16 @@ func launchAgentPlist(binary, configPath, logDir string) string {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ExitTimeOut</key>
+  <integer>40</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>HOME</key>
+    <string>` + escape(home) + `</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>` + servicePATH + `</string>
   </dict>
   <key>StandardOutPath</key>
   <string>` + escape(filepath.Join(logDir, "stdout.log")) + `</string>

@@ -16,6 +16,8 @@ const usage = `usage: repo-sync <command> [options]
   setup                 find repositories, choose which to sync, install the service
   add [path]            start syncing a repository (defaults to the current one)
   allow <path>          let a secret-guarded file in the current repository sync
+  status                show service readiness and repository health
+  uninstall             remove the service, settings, logs, and program
   run                   run the sync service in the foreground (used by launchd)
 
 Every command accepts --config <path>.`
@@ -56,6 +58,28 @@ func Run(args []string) error {
 		return runSetup(context.Background(), setupOptions{
 			configPath: *configPath, binary: binary, noLaunch: *noLaunch, in: os.Stdin, out: os.Stdout,
 		})
+	case "status":
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("usage: repo-sync status [--config path]")
+		}
+		return runStatus(context.Background(), *configPath, defaultService(), os.Stdout)
+	case "uninstall":
+		yes := flags.Bool("yes", false, "remove without a confirmation prompt")
+		keepBinary := flags.Bool("keep-binary", false, "remove service and data, but keep the installed program")
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("usage: repo-sync uninstall [--yes] [--keep-binary] [--config path]")
+		}
+		binary, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		return runUninstall(context.Background(), uninstallOptions{configPath: *configPath, binary: binary, yes: *yes, keepBinary: *keepBinary, in: os.Stdin, out: os.Stdout, service: defaultService()})
 	case "add":
 		if err := flags.Parse(args); err != nil {
 			return err
@@ -107,7 +131,7 @@ func runAdd(configPath, path string, out *os.File) error {
 	if err != nil {
 		return err
 	}
-	runner := execCommandRunner{}
+	runner := backgroundRunner()
 	if _, err := runGit(context.Background(), runner, root, "remote", "get-url", "origin"); err != nil {
 		return fmt.Errorf("%s has no origin remote; repo-sync needs one to push to", root)
 	}

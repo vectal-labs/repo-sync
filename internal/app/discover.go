@@ -38,9 +38,8 @@ type repoGroup struct {
 }
 
 // discoverRepos scans shallowly under home for Git repositories that have an
-// origin remote. Repositories are grouped by parent folder. Groups with at
-// least two repositories are returned first, ranked by size; lone repositories
-// are returned separately so setup can mention `repo-sync add`.
+// origin remote. Every repository appears in a parent-folder group, ranked by
+// size. The second return value is retained for existing callers and is nil.
 func discoverRepos(ctx context.Context, runner commandRunner, home string) ([]repoGroup, []discoveredRepo, error) {
 	var repos []discoveredRepo
 	err := filepath.WalkDir(home, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -83,13 +82,8 @@ func discoverRepos(ctx context.Context, runner commandRunner, home string) ([]re
 		byParent[parent] = append(byParent[parent], repo)
 	}
 	var groups []repoGroup
-	var singles []discoveredRepo
 	for parent, members := range byParent {
 		sort.Slice(members, func(i, j int) bool { return members[i].Name < members[j].Name })
-		if len(members) < 2 {
-			singles = append(singles, members...)
-			continue
-		}
 		groups = append(groups, repoGroup{Parent: parent, Repos: members})
 	}
 	sort.Slice(groups, func(i, j int) bool {
@@ -98,8 +92,7 @@ func discoverRepos(ctx context.Context, runner commandRunner, home string) ([]re
 		}
 		return groups[i].Parent < groups[j].Parent
 	})
-	sort.Slice(singles, func(i, j int) bool { return singles[i].Path < singles[j].Path })
-	return groups, singles, nil
+	return groups, nil, nil
 }
 
 // selectRepos shows every discovered repository once, numbered, and asks
@@ -107,11 +100,15 @@ func discoverRepos(ctx context.Context, runner commandRunner, home string) ([]re
 // Already-synced repositories are shown but cannot be chosen again.
 func selectRepos(in io.Reader, out io.Writer, groups []repoGroup, cfg config) ([]discoveredRepo, error) {
 	var options []discoveredRepo
-	fmt.Fprintln(out, "Found these repositories:")
+	if len(groups) > 0 {
+		fmt.Fprintln(out, "Found these repositories:")
+	} else {
+		fmt.Fprintln(out, "No repositories found. You can add a path below.")
+	}
 	for _, group := range groups {
 		fmt.Fprintf(out, "\n%s\n", group.Parent)
 		for _, repo := range group.Repos {
-			if _, synced := cfg.findRepo(repo.Path); synced {
+			if repositoryIsSynced(cfg, repo.Path) {
 				fmt.Fprintf(out, "      %s (already synced)\n", repo.Name)
 				continue
 			}
@@ -119,20 +116,48 @@ func selectRepos(in io.Reader, out io.Writer, groups []repoGroup, cfg config) ([
 			fmt.Fprintf(out, "  %2d. %s\n", len(options), repo.Name)
 		}
 	}
-	if len(options) == 0 {
-		fmt.Fprintln(out, "\nNothing new to add.")
-		return nil, nil
+	if len(options) == 0 && len(groups) > 0 {
+		fmt.Fprintln(out, "\nNo new repositories listed. You can add a path below.")
 	}
-	scanner := bufio.NewScanner(in)
+	reader, ok := in.(*bufio.Reader)
+	if !ok {
+		reader = bufio.NewReader(in)
+	}
 	for {
-		fmt.Fprintf(out, "\nWhich should repo-sync keep in sync? Enter numbers (e.g. 1 3 5-7), 'all', or press Enter for none: ")
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return nil, err
-			}
-			return nil, nil
+		fmt.Fprint(out, "\nChoose numbers (e.g. 1 3 5-7), 'all', or 'none'. Enter an absolute or ~/ path to add it to this list. Press Enter for none: ")
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return nil, err
 		}
-		indexes, err := parseSelection(scanner.Text(), len(options))
+		input := strings.TrimSpace(line)
+		if filepath.IsAbs(input) || strings.HasPrefix(input, "~/") {
+			repo, err := manualRepository(input)
+			if err != nil {
+				fmt.Fprintln(out, err)
+				continue
+			}
+			if repositoryIsSynced(cfg, repo.Path) {
+				fmt.Fprintf(out, "%s is already synced. Choose another repository.\n", repo.Path)
+				continue
+			}
+			index := 0
+			for i, option := range options {
+				if canonicalRepoPath(option.Path) == canonicalRepoPath(repo.Path) {
+					index = i + 1
+					break
+				}
+			}
+			if index == 0 {
+				options = append(options, repo)
+				index = len(options)
+				fmt.Fprintf(out, "  %2d. %s (%s)\n", index, repo.Name, repo.Path)
+			} else {
+				fmt.Fprintf(out, "%s is already listed as %d.\n", repo.Path, index)
+			}
+			fmt.Fprintf(out, "Nothing selected yet. Enter %d or 'all' to select it, or add another path.\n", index)
+			continue
+		}
+		indexes, err := parseSelection(input, len(options))
 		if err != nil {
 			fmt.Fprintf(out, "%v\n", err)
 			continue
@@ -143,6 +168,41 @@ func selectRepos(in io.Reader, out io.Writer, groups []repoGroup, cfg config) ([
 		}
 		return selected, nil
 	}
+}
+
+func manualRepository(path string) (discoveredRepo, error) {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return discoveredRepo{}, fmt.Errorf("find home directory: %w", err)
+		}
+		path = filepath.Join(home, path[2:])
+	}
+	root, err := repoRoot(path)
+	if err != nil {
+		return discoveredRepo{}, err
+	}
+	if _, err := runGit(context.Background(), execCommandRunner{}, root, "remote", "get-url", "origin"); err != nil {
+		return discoveredRepo{}, fmt.Errorf("%s has no origin remote; add one with `git remote add origin <url>`", root)
+	}
+	return discoveredRepo{Path: root, Name: filepath.Base(root)}, nil
+}
+
+func canonicalRepoPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return filepath.Clean(path)
+}
+
+func repositoryIsSynced(cfg config, path string) bool {
+	path = canonicalRepoPath(path)
+	for _, repo := range cfg.Repositories {
+		if canonicalRepoPath(repo.Path) == path {
+			return true
+		}
+	}
+	return false
 }
 
 // parseSelection turns "1 3 5-7" or "all" into sorted unique 1-based indexes.
@@ -157,6 +217,9 @@ func parseSelection(input string, count int) ([]int, error) {
 			all[i] = i + 1
 		}
 		return all, nil
+	}
+	if count == 0 {
+		return nil, fmt.Errorf("no numbered repositories yet; enter an absolute or ~/ path, or press Enter for none")
 	}
 	chosen := make(map[int]bool)
 	for _, token := range strings.FieldsFunc(input, func(r rune) bool { return r == ' ' || r == ',' }) {

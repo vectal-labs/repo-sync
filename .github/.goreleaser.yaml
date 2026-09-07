@@ -29,11 +29,63 @@ homebrew_casks:
     homepage: https://github.com/vectal-labs/repo-sync
     description: Keeps your Git repositories in sync automatically on macOS
     license: MIT
-    binary: repo-sync
+    binaries: [repo-sync]
+    dependencies:
+      - formula: git
+      - formula: gh
+    # Uninstall also runs during upgrades. User data belongs in zap.
+    zap:
+      trash:
+        - ~/Library/LaunchAgents/com.vectal-labs.repo-sync.plist
+        - ~/Library/Application Support/repo-sync
+        - ~/Library/Logs/repo-sync
+        - ~/Library/Caches/repo-sync
+    custom_block: |
+      module RepoSyncCaskLifecycle
+        def self.stop(command, target)
+          state = command.call("/bin/launchctl", args: ["print", target], must_succeed: false, print_stderr: false, timeout: 5)
+          if state.exit_status != 0
+            output = state.stdout + state.stderr
+            return if output.include?("Could not find service")
+            raise "Cannot inspect repo-sync service: #{output}"
+          end
+          pid = state.stdout[/^\s*pid = (\d+)\s*$/, 1].to_i
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 45
+          command.call "/bin/launchctl", args: ["bootout", target], timeout: 45
+          # bootout unregisters immediately; the old process may still be syncing.
+          if pid.positive?
+            loop do
+              begin
+                Process.kill(0, pid)
+              rescue Errno::ESRCH
+                break
+              end
+              raise "repo-sync did not stop within 45 seconds; retry when it has stopped" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+              Kernel.sleep 0.1
+            end
+          end
+        end
+      end
     caveats: Run `repo-sync setup` to choose repositories and install the background service.
     hooks:
+      pre:
+        uninstall: |
+          # Homebrew also runs this during upgrade. Keep the plist for reloading.
+          RepoSyncCaskLifecycle.stop(method(:system_command), "gui/#{Process.uid}/com.vectal-labs.repo-sync")
       post:
         install: |
           if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/repo-sync"]
+          end
+          plist = File.expand_path("~/Library/LaunchAgents/com.vectal-labs.repo-sync.plist")
+          if File.file?(plist)
+            domain = "gui/#{Process.uid}"
+            RepoSyncCaskLifecycle.stop(method(:system_command), "#{domain}/com.vectal-labs.repo-sync")
+            # Keep the user's config and refresh older, versioned binary paths.
+            require "json"
+            arguments = JSON.parse(system_command("/usr/bin/plutil", args: ["-extract", "ProgramArguments", "json", "-o", "-", plist]).stdout)
+            arguments[0] = "#{staged_path}/repo-sync"
+            system_command "/usr/bin/plutil", args: ["-replace", "ProgramArguments", "-json", JSON.generate(arguments), plist]
+            system_command "/bin/launchctl", args: ["bootstrap", domain, plist], timeout: 10
+            system_command "/bin/launchctl", args: ["print", "#{domain}/com.vectal-labs.repo-sync"], timeout: 5
           end
