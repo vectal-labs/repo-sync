@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -107,7 +108,7 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 		if !commitLocal {
 			return report, nil
 		}
-		report.Committed, err = s.commit(ctx, repo, changed)
+		report.Committed, err = s.commit(ctx, repo, branch)
 		if err != nil {
 			return report, err
 		}
@@ -127,7 +128,8 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 		}
 	}
 
-	remoteRef := repo.Remote + "/" + branch
+	// The full ref name: a local branch called "origin/main" must never win.
+	remoteRef := "refs/remotes/" + repo.Remote + "/" + branch
 	remoteBefore, _ := s.revParse(ctx, repo.Path, remoteRef)
 	// Someone else may push between our fetch and our push. That is normal
 	// teamwork, not a failure: fetch, rebase, and push once more right away.
@@ -137,12 +139,12 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 		}
 		remoteAfter, _ := s.revParse(ctx, repo.Path, remoteRef)
 		report.Pulled = remoteAfter != remoteBefore
-		if err := s.rebase(ctx, repo.Path, remoteRef); err != nil {
+		head, err := s.integrate(ctx, repo, branch, remoteRef, remoteAfter)
+		if err != nil {
 			return report, err
 		}
-		head, err := s.revParse(ctx, repo.Path, "HEAD")
-		if err != nil || head == "" {
-			return report, fmt.Errorf("resolve HEAD: %w", err) // an empty source would delete the remote branch
+		if head == "" {
+			return report, errors.New("resolve " + branch + ": empty") // an empty source would delete the remote branch
 		}
 		if head == remoteAfter {
 			report.Checked, report.Withheld = true, nil
@@ -311,18 +313,22 @@ func unpublishedSubmodules(err error) []string {
 // deletion replays or the rebase aborts. Nothing can put such a file back
 // safely afterwards (an editor may have written newer contents meanwhile), so
 // the rebase is refused instead and the repository waits for the user.
-func (s gitSyncer) rebase(ctx context.Context, path, remoteRef string) error {
-	if file, err := s.ignoredFileInTheWay(ctx, path, remoteRef); err != nil {
+//
+// It runs with the checkout owned, so nobody else can start a rebase
+// meanwhile: any rebase state left behind is ours to abort. --no-autostash
+// keeps a dirty worktree a clean skip instead of a stash.
+func (s gitSyncer) rebase(ctx context.Context, c *checkout, remoteRef string) error {
+	if file, err := s.ignoredFileInTheWay(ctx, c, remoteRef); err != nil {
 		return err
 	} else if file != "" {
 		return fmt.Errorf("ignored file %s would be overwritten by rebasing onto %s; move it aside until the repository has synced", file, remoteRef)
 	}
-	_, err := runGit(ctx, s.runner, path, "rebase", remoteRef)
+	_, err := c.git(ctx, "", "rebase", "--no-autostash", remoteRef)
 	if err == nil {
 		return nil
 	}
-	if s.rebaseInProgress(ctx, path) {
-		_, _ = runGit(ctx, s.runner, path, "rebase", "--abort")
+	if s.rebaseInProgress(ctx, c.path) {
+		_, _ = c.git(ctx, "", "rebase", "--abort")
 		return &skipError{reason: "rebase conflict with " + remoteRef + "; rebase aborted, will retry"}
 	}
 	// A file changed between our clean check and the rebase. Nothing is
@@ -337,25 +343,25 @@ func (s gitSyncer) rebase(ctx context.Context, path, remoteRef string) error {
 // remoteRef would overwrite: it exists on disk at a path remoteRef has and
 // HEAD does not. When remoteRef is already part of HEAD's history the rebase
 // checks nothing out, so there is nothing in the way.
-func (s gitSyncer) ignoredFileInTheWay(ctx context.Context, path, remoteRef string) (string, error) {
-	remoteHead, err := s.revParse(ctx, path, remoteRef)
+func (s gitSyncer) ignoredFileInTheWay(ctx context.Context, c *checkout, remoteRef string) (string, error) {
+	remoteHead, err := s.revParse(ctx, c.path, remoteRef)
 	if err != nil {
 		return "", err
 	}
-	base, err := runGit(ctx, s.runner, path, "merge-base", "HEAD", remoteRef)
+	base, err := c.git(ctx, "", "merge-base", "HEAD", remoteRef)
 	if err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(base) == remoteHead {
 		return "", nil
 	}
-	output, err := runGit(ctx, s.runner, path, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", "HEAD", remoteRef)
+	output, err := c.git(ctx, "", "diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", "HEAD", remoteRef)
 	if err != nil {
 		return "", err
 	}
 	var present []string
 	for _, name := range splitNUL(output) {
-		if _, err := os.Lstat(filepath.Join(path, name)); err == nil {
+		if _, err := os.Lstat(filepath.Join(c.path, name)); err == nil {
 			present = append(present, name)
 		}
 	}
@@ -363,7 +369,7 @@ func (s gitSyncer) ignoredFileInTheWay(ctx context.Context, path, remoteRef stri
 		return "", nil
 	}
 	args := append([]string{"--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--"}, present...)
-	output, err = runGit(ctx, s.runner, path, args...)
+	output, err = c.git(ctx, "", args...)
 	if err != nil {
 		return "", err
 	}
@@ -405,15 +411,41 @@ func (s gitSyncer) preflight(ctx context.Context, repo repoConfig) (string, erro
 		return "", &skipError{reason: operation + " is in progress; repository was not touched"}
 	}
 	branch := s.defaultBranch(ctx, repo)
-	current, err := runGit(ctx, s.runner, repo.Path, "symbolic-ref", "--quiet", "--short", "HEAD")
-	if err != nil {
-		return "", &skipError{reason: "HEAD is detached; only " + branch + " is synced", offBranch: true}
-	}
-	current = strings.TrimSpace(current)
-	if current != branch {
-		return "", &skipError{reason: fmt.Sprintf("branch is %s; only %s is synced", current, branch), offBranch: true}
+	if err := s.checkBranch(ctx, repo, branch); err != nil {
+		return "", err
 	}
 	return branch, nil
+}
+
+// checkBranch confirms HEAD is the default branch. Outside the checkout lock
+// this is only an early, cheap skip; the authoritative check happens again
+// once the checkout is owned.
+func (s gitSyncer) checkBranch(ctx context.Context, repo repoConfig, branch string) error {
+	current, err := s.currentBranch(ctx, repo.Path)
+	if err != nil {
+		return err
+	}
+	if current == "" {
+		return &skipError{reason: "HEAD is detached; only " + branch + " is synced", offBranch: true}
+	}
+	if current != branch {
+		return &skipError{reason: fmt.Sprintf("branch is %s; only %s is synced", current, branch), offBranch: true}
+	}
+	return nil
+}
+
+// currentBranch returns the branch HEAD points at, or "" when HEAD is
+// detached. Git exits 1 for a detached HEAD; anything else is a real failure.
+func (s gitSyncer) currentBranch(ctx context.Context, path string) (string, error) {
+	output, err := runGit(ctx, s.runner, path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
 }
 
 // defaultBranch reads the remote's default branch from refs/remotes/<remote>/HEAD
@@ -436,19 +468,25 @@ func (s gitSyncer) defaultBranch(ctx context.Context, repo repoConfig) string {
 // is syncable: it publishes nothing, and holding it back would leave the
 // repository stuck behind a tracked secret that no longer exists on disk.
 func (s gitSyncer) changes(ctx context.Context, repo repoConfig) ([]change, []change, error) {
-	output, err := runGit(ctx, s.runner, repo.Path, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	output, err := runGit(ctx, s.runner, repo.Path, statusArgs...)
 	if err != nil {
 		return nil, nil, err
 	}
-	var allowed, blocked []change
-	for _, entry := range parseStatus(output) {
-		if isSecretPath(entry.path, repo.Allow) && !entry.deleted() {
+	allowed, blocked := splitChanges(output, repo.Allow)
+	return allowed, blocked, nil
+}
+
+var statusArgs = []string{"status", "--porcelain=v1", "-z", "--untracked-files=all"}
+
+func splitChanges(status string, allow []string) (allowed, blocked []change) {
+	for _, entry := range parseStatus(status) {
+		if isSecretPath(entry.path, allow) && !entry.deleted() {
 			blocked = append(blocked, entry)
 		} else {
 			allowed = append(allowed, entry)
 		}
 	}
-	return allowed, blocked, nil
+	return allowed, blocked
 }
 
 // parseStatus reads `git status --porcelain=v1 -z`. Renames and copies carry a
@@ -479,17 +517,27 @@ func parseStatus(output string) []change {
 	return result
 }
 
-// commit stages exactly the given paths and commits them. Blocked secret files
-// that a user staged by hand are unstaged first so they never reach the remote.
-func (s gitSyncer) commit(ctx context.Context, repo repoConfig, changed []change) (int, error) {
-	path := repo.Path
-	_, blocked, err := s.changes(ctx, repo)
+// commit stages every syncable change and commits it on the default branch.
+// It owns the checkout for the whole operation, so a human Git command in the
+// meantime is refused by Git itself instead of racing with us. Blocked secret
+// files that a user staged by hand are unstaged first so they never reach the
+// remote.
+func (s gitSyncer) commit(ctx context.Context, repo repoConfig, branch string) (int, error) {
+	c, err := s.lockCheckout(ctx, repo, branch)
 	if err != nil {
 		return 0, err
 	}
+	defer c.discard()
+	changed, blocked, err := c.changes(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(changed) == 0 {
+		return 0, nil
+	}
 	for _, entry := range blocked {
 		if entry.staged() {
-			if _, err := runGit(ctx, s.runner, path, "--literal-pathspecs", "reset", "-q", "--", entry.path); err != nil {
+			if _, err := c.git(ctx, "", "--literal-pathspecs", "reset", "-q", "--", entry.path); err != nil {
 				return 0, err
 			}
 		}
@@ -508,7 +556,7 @@ func (s gitSyncer) commit(ctx context.Context, repo repoConfig, changed []change
 	// With an empty pathspec `git add -A` would stage the whole worktree,
 	// including files the guard just unstaged. Staged-only changes need no add.
 	if spec.Len() > 0 {
-		if _, err := s.runner.run(ctx, path, spec.String(), "git", "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
+		if _, err := c.git(ctx, spec.String(), "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
 			// A file listed by status vanished before add saw it (editors and
 			// agents create and delete files quickly). Retry from a fresh status.
 			if strings.Contains(err.Error(), "did not match any files") {
@@ -517,7 +565,7 @@ func (s gitSyncer) commit(ctx context.Context, repo repoConfig, changed []change
 			return 0, err
 		}
 	}
-	output, err := runGit(ctx, s.runner, path, "diff", "--cached", "--name-only", "-z")
+	output, err := c.git(ctx, "", "diff", "--cached", "--name-only", "-z")
 	if err != nil {
 		return 0, err
 	}
@@ -535,10 +583,193 @@ func (s gitSyncer) commit(ctx context.Context, repo repoConfig, changed []change
 	for _, file := range files {
 		fmt.Fprintf(&message, "- %s\n", file)
 	}
-	if _, err := s.runner.run(ctx, path, message.String(), "git", "commit", "-q", "-F", "-"); err != nil {
+	if _, err := c.git(ctx, message.String(), "commit", "-q", "-F", "-"); err != nil {
 		return 0, err
 	}
-	return len(files), nil
+	// Where did the commit land? Only the default branch's own movement proves
+	// it; HEAD may have been moved afterwards by a hook (hooks inherit our
+	// index file and get past the lock). The locked index is installed either
+	// way: it reflects everything the commit and its hooks did.
+	tip, err := s.revParse(ctx, repo.Path, "refs/heads/"+branch)
+	if err != nil {
+		return 0, err
+	}
+	if tip != c.base {
+		if err := c.install(); err != nil {
+			return 0, err
+		}
+		return len(files), nil
+	}
+	// `git checkout -b` at the same commit needs no index lock, so the commit
+	// landed on that brand-new branch instead. That is provably our commit
+	// only if its parent is the tip we started from; then put the branch back
+	// exactly where it was and leave the edits in the worktree, uncommitted.
+	head, err := c.head(ctx)
+	if err != nil {
+		return 0, err
+	}
+	commit, err := s.revParse(ctx, repo.Path, "HEAD")
+	if err != nil {
+		return 0, err
+	}
+	if parent, _ := s.revParse(ctx, repo.Path, commit+"^"); head != "" && head != branch && parent == c.base {
+		if _, err := c.git(ctx, "", "update-ref", "refs/heads/"+head, c.base, commit); err != nil {
+			return 0, err
+		}
+		return 0, &skipError{reason: fmt.Sprintf("branch changed to %s during commit; commit undone, only %s is synced", head, branch), offBranch: true}
+	}
+	return 0, errors.Join(fmt.Errorf("commit did not land on %s (HEAD is %q); a hook changed the checkout?", branch, head), c.install())
+}
+
+// integrate rebases the default branch onto the fetched remote while owning
+// the checkout, and returns the verified tip of the branch to publish. Only
+// the branch's own movement proves the rebase acted on it; HEAD's reflog
+// tells who else moved HEAD, and when.
+func (s gitSyncer) integrate(ctx context.Context, repo repoConfig, branch, remoteRef, remoteAfter string) (string, error) {
+	if tip, _ := s.revParse(ctx, repo.Path, "refs/heads/"+branch); tip == remoteAfter {
+		return tip, nil
+	}
+	c, err := s.lockCheckout(ctx, repo, branch)
+	if err != nil {
+		return "", err
+	}
+	defer c.discard()
+	if c.base == remoteAfter {
+		return c.base, nil
+	}
+	reflogBefore := s.headReflog(ctx, repo.Path)
+	if err := s.rebase(ctx, c, remoteRef); err != nil {
+		return "", err
+	}
+	tip, err := s.revParse(ctx, repo.Path, "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	head, err := c.head(ctx)
+	if err != nil {
+		return "", err
+	}
+	reflogAfter := s.headReflog(ctx, repo.Path)
+	entries := reflogAfter[:max(0, len(reflogAfter)-len(reflogBefore))]
+	// Split what moved HEAD, newest first: after the rebase finished, during
+	// it, or before it started. The rebase's own entries all say "rebase".
+	var after, during, before []reflogEntry
+	bucket := &after
+	for _, entry := range entries {
+		switch {
+		case strings.HasPrefix(entry.subject, "rebase (finish)"):
+			bucket = &during
+		case strings.HasPrefix(entry.subject, "rebase (start)"):
+			bucket = &before
+		case strings.HasPrefix(entry.subject, "rebase"):
+		default:
+			*bucket = append(*bucket, entry)
+		}
+	}
+	switch {
+	case tip != c.base:
+		// The rebase acted on the default branch. Anything else that moved
+		// HEAD while it ran (a hook that inherited our index file) means Git
+		// finished with foreign history on the branch: put it back.
+		foreign := ""
+		if len(during) > 0 {
+			foreign = during[0].subject
+		} else if len(entries) == 0 {
+			if foreign, err = s.foreignCommits(ctx, repo.Path, remoteAfter, c.base, tip); err != nil {
+				return "", err
+			}
+		}
+		if foreign != "" {
+			if _, err := c.git(ctx, "", "update-ref", "refs/heads/"+branch, c.base, tip); err != nil {
+				return "", err
+			}
+			if _, err := c.git(ctx, "", "read-tree", "-m", "-u", tip, c.base); err != nil {
+				return "", err
+			}
+			return "", fmt.Errorf("something other than the rebase changed the checkout mid-rebase (%s); %s restored", foreign, branch)
+		}
+		if head != branch {
+			// A hook switched branches once the rebase was complete. The
+			// branch is fine; it is just no longer checked out.
+			return "", errors.Join(&skipError{reason: fmt.Sprintf("branch changed to %s after rebase; only %s is synced", head, branch), offBranch: true}, c.install())
+		}
+		return tip, c.install()
+	case head != branch:
+		// The default branch did not move, so Git rebased the branch HEAD was
+		// on. Undo that only when the reflog proves it was created at our
+		// starting commit right before the rebase (`git checkout -b` needs no
+		// index lock); a branch with history of its own is never touched.
+		if len(during) == 0 && len(after) == 0 && len(before) == 1 && before[0].hash == c.base {
+			rebased, err := s.revParse(ctx, repo.Path, "HEAD")
+			if err != nil {
+				return "", err
+			}
+			if _, err := c.git(ctx, "", "read-tree", "-m", "-u", rebased, c.base); err != nil {
+				return "", err
+			}
+			if _, err := c.git(ctx, "", "update-ref", "refs/heads/"+head, c.base, rebased); err != nil {
+				return "", err
+			}
+			return "", &skipError{reason: fmt.Sprintf("branch changed to %s during rebase; rebase undone, only %s is synced", head, branch), offBranch: true}
+		}
+		return "", errors.Join(&skipError{reason: fmt.Sprintf("branch changed to %s during rebase; only %s is synced", head, branch), offBranch: true}, c.install())
+	default:
+		return tip, c.install()
+	}
+}
+
+type reflogEntry struct{ hash, subject string }
+
+// headReflog returns HEAD's reflog, newest first. A repository without
+// reflogs yields nothing, and the callers fall back to commit identity.
+func (s gitSyncer) headReflog(ctx context.Context, path string) []reflogEntry {
+	output, err := runGit(ctx, s.runner, path, "reflog", "show", "--format=%H%x00%gs", "HEAD")
+	if err != nil {
+		return nil
+	}
+	var entries []reflogEntry
+	for _, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+		if hash, subject, ok := strings.Cut(line, "\x00"); ok {
+			entries = append(entries, reflogEntry{hash: hash, subject: subject})
+		}
+	}
+	return entries
+}
+
+// foreignCommits returns the subject of a commit in remote..after that is not
+// a replay of a commit in remote..before, or "" when every commit matches. A
+// rebase keeps author, author date, and message verbatim. This is only the
+// fallback for repositories without reflogs; metadata alone is not identity.
+func (s gitSyncer) foreignCommits(ctx context.Context, path, remote, before, after string) (string, error) {
+	identities := func(tip string) (map[string]int, error) {
+		output, err := runGit(ctx, s.runner, path, "log", "--format=%x1e%an%x00%ae%x00%aI%x00%B", remote+".."+tip)
+		if err != nil {
+			return nil, err
+		}
+		counts := map[string]int{}
+		for _, record := range strings.Split(output, "\x1e") {
+			if record != "" {
+				counts[record]++
+			}
+		}
+		return counts, nil
+	}
+	expected, err := identities(before)
+	if err != nil {
+		return "", err
+	}
+	actual, err := identities(after)
+	if err != nil {
+		return "", err
+	}
+	for record, count := range actual {
+		if expected[record] < count {
+			fields := strings.SplitN(record, "\x00", 4)
+			subject, _, _ := strings.Cut(fields[len(fields)-1], "\n")
+			return subject, nil
+		}
+	}
+	return "", nil
 }
 
 func (s gitSyncer) revParse(ctx context.Context, path, ref string) (string, error) {
