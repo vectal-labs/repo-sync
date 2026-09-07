@@ -12,7 +12,7 @@ For notes, docs, config, and small team repos. macOS only.
 brew install --cask vectal-labs/tap/repo-sync && repo-sync setup
 ```
 
-![Three teammates editing notes, docs, and team context, kept up to date by repo-sync and GitHub](docs/team-sync.png)
+![Three teammates editing notes, docs, and team context, kept up to date by repo-sync and GitHub](docs/team-sync.webp)
 
 Requires [Homebrew](https://brew.sh). Git and GitHub CLI are installed for you.
 
