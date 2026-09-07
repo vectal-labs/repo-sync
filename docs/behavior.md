@@ -17,8 +17,11 @@
 
 ## uninstall
 
-- `repo-sync uninstall` asks for confirmation, stops the service, and removes its plist, settings, logs, cache, and installed binary. Homebrew installations are removed through Homebrew.
-- use `--yes` for noninteractive removal or `--keep-binary` to retain the executable. use `--config /path/to/config.json` for a custom config.
+- `repo-sync uninstall` previews this user's recorded and standard install locations, including `PATH`, Go, and Homebrew locations. it finds verified repo-sync copies there; it does not search the whole disk. Homebrew installations are removed through Homebrew.
+- after confirmation, it stops the service and gracefully stops matching processes owned by this user. macOS process identity and executable checks prevent stopping unrelated processes. shutdown waits up to 45 seconds; a failure stops cleanup. processes whose executable macOS hides cannot be identified, including binaries deleted while running.
+- cleanup removes known settings, the plist, stale status files, rotated logs, and generated temporary files in recognized locations. unrecognized files are preserved. custom config folders are never deleted recursively.
+- use `--yes` for noninteractive removal or `--config /path/to/config.json` for a custom config. `--keep-binary` retains the binaries and their paths in `install.json` for later removal.
+- every run reports `Removed`, `Preserved`, and `Failed`. incomplete cleanup returns a nonzero exit code and keeps the ownership record and remaining program when possible. fix the reported failure and rerun uninstall.
 - repositories, Git history, shared Git credentials, Git, and GitHub CLI are preserved.
 - `brew uninstall --cask repo-sync` stops the service but retains user files. add `--zap` to remove the standard settings, logs, cache, and plist too. Homebrew moves these files to the trash.
 
@@ -68,6 +71,7 @@
 ## files
 
 - config: `~/Library/Application Support/repo-sync/config.json`. one json file. edit it by hand if you like, then run `repo-sync setup` again or restart the service.
+- installation history: `~/Library/Application Support/repo-sync/install.json`. setup records config and binary paths so uninstall can find older installations.
 - logs: `~/Library/Logs/repo-sync/`.
 - runtime status: `~/Library/Caches/repo-sync/`. kept separate from custom config files so health updates do not change your repos.
 - service: `~/Library/LaunchAgents/com.vectal-labs.repo-sync.plist`. it starts at login and restarts on crash.

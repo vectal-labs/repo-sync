@@ -44,6 +44,44 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	if service == nil {
 		service = defaultService()
 	}
+	record, err := loadInstallRecord()
+	if err != nil {
+		return err
+	}
+	previousRecord, err := snapshotFile(installRecordPath())
+	if err != nil {
+		return err
+	}
+	plistPath := service.plistPath(home)
+	previousPlist, err := snapshotFile(plistPath)
+	if err != nil {
+		return err
+	}
+	configPaths := []string{opts.configPath}
+	if previousPlist.exists {
+		installed, err := installedConfigPath(plistPath)
+		if err != nil {
+			return err
+		}
+		if installed == "" {
+			installed = defaultConfigPath()
+		}
+		configPaths = append(configPaths, installed)
+		previousBinary, err := installedBinaryPath(plistPath)
+		if err != nil {
+			return err
+		}
+		if previousBinary != "" {
+			record, err = mergeInstallation(record, nil, previousBinary)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	record, err = mergeInstallation(record, configPaths, opts.binary)
+	if err != nil {
+		return err
+	}
 	fmt.Fprintln(opts.out, "1/4 Checking tools")
 	if err := checkGitTools(ctx, runner); err != nil {
 		return err
@@ -78,7 +116,6 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	if err := verifyRepositories(ctx, runner, cfg.Repositories, input, opts.out); err != nil {
 		return err
 	}
-	plistPath := service.plistPath(home)
 	logDir := filepath.Join(home, "Library", "Logs", "repo-sync")
 	if opts.noLaunch {
 		fmt.Fprintln(opts.out, "\n4/4 Save service files")
@@ -87,10 +124,6 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	}
 	// Preserve the previous installation if writing or loading the new one fails.
 	previousConfig, err := snapshotFile(opts.configPath)
-	if err != nil {
-		return err
-	}
-	previousPlist, err := snapshotFile(plistPath)
 	if err != nil {
 		return err
 	}
@@ -109,7 +142,7 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 				return fmt.Errorf("%w; cannot restore files while the new service may still be running: %v", cause, err)
 			}
 		}
-		restoreErrors = append(restoreErrors, previousConfig.restore(opts.configPath), previousPlist.restore(plistPath))
+		restoreErrors = append(restoreErrors, previousConfig.restore(opts.configPath), previousPlist.restore(plistPath), previousRecord.restore(installRecordPath()))
 		if wasLoaded {
 			restoreErrors = append(restoreErrors, service.start(ctx, plistPath))
 		}
@@ -133,15 +166,20 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	if err := writeFileAtomic(plistPath, []byte(plist), 0o644); err != nil {
 		return rollback(err)
 	}
-	if opts.noLaunch {
-		fmt.Fprintln(opts.out, "Files saved. The service was not started (--no-launch).")
-	} else {
+	if !opts.noLaunch {
 		if err := service.start(ctx, plistPath); err != nil {
 			return rollback(err)
 		}
 		if err := service.waitReady(ctx, opts.configPath, 15*time.Second); err != nil {
 			return rollback(err)
 		}
+	}
+	if err := writeInstallRecord(record); err != nil {
+		return rollback(err)
+	}
+	if opts.noLaunch {
+		fmt.Fprintln(opts.out, "Files saved. The service was not started (--no-launch).")
+	} else {
 		fmt.Fprintf(opts.out, "Service is running with %d repositories. Starts automatically at login.\n", len(cfg.Repositories))
 	}
 	fmt.Fprintf(opts.out, "Config: %s\nLogs: %s\nCheck progress: %s\nRemove: %s\n", opts.configPath, logDir, configCommand("status", opts.configPath), configCommand("uninstall", opts.configPath))

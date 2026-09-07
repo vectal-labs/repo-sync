@@ -12,6 +12,28 @@ import (
 	"time"
 )
 
+func TestServiceInspectRecognizesMissingServiceOnStderr(t *testing.T) {
+	for _, test := range []struct {
+		name, message string
+		wantError     bool
+	}{
+		{"missing", `Could not find service "test.repo-sync" in domain for user gui: 501`, false},
+		{"permission denied", "Operation not permitted", true},
+		{"different service", `Could not find service "test.repo-sync-other" in domain for user gui: 501`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := preflightRunnerFunc(func(ctx context.Context, _, _, _ string, _ ...string) (string, error) {
+				return (execCommandRunner{}).run(ctx, "", test.message, "/bin/sh", "-c", "cat >&2; exit 113")
+			})
+			service := &launchService{runner: runner, domain: "gui/test", label: "test.repo-sync"}
+			state, err := service.inspect(context.Background())
+			if (err != nil) != test.wantError || state.loaded {
+				t.Fatalf("inspect returned %+v, %v", state, err)
+			}
+		})
+	}
+}
+
 type lifecycleRunner struct {
 	loaded      bool
 	pid         int

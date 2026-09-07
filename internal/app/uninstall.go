@@ -3,7 +3,6 @@ package app
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,21 +11,27 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
 type uninstallOptions struct {
-	configPath string
-	binary     string
-	yes        bool
-	keepBinary bool
-	in         io.Reader
-	out        io.Writer
-	service    *launchService
+	configPath        string
+	binary            string
+	yes               bool
+	keepBinary        bool
+	in                io.Reader
+	out               io.Writer
+	service           *launchService
+	binaryPaths       []string // nil searches standard locations; tests supply isolated candidates
+	discoverProcesses func(context.Context, []string) ([]ownedProcess, error)
+	stopProcesses     func(context.Context, []ownedProcess, time.Duration) error
 }
 
-type binaryRemoval struct{ executable, link, brew, kind string }
+type binaryRemoval struct {
+	executable, brew, kind string
+	paths                  []string
+	aliases                []binaryAlias
+}
 
 func planBinaryRemoval(binary string) (binaryRemoval, error) {
 	absolute, err := filepath.Abs(binary)
@@ -37,7 +42,7 @@ func planBinaryRemoval(binary string) (binaryRemoval, error) {
 	if err != nil {
 		return binaryRemoval{}, err
 	}
-	if filepath.Base(resolved) != "repo-sync" {
+	if !isRepoSyncBinary(resolved) {
 		return binaryRemoval{}, fmt.Errorf("cannot remove unrecognized executable %s; use --keep-binary", resolved)
 	}
 	for _, item := range []struct{ dir, kind string }{{"Caskroom", "--cask"}, {"Cellar", "--formula"}} {
@@ -51,129 +56,206 @@ func planBinaryRemoval(binary string) (binaryRemoval, error) {
 			return binaryRemoval{brew: brew, kind: item.kind}, nil
 		}
 	}
-	plan := binaryRemoval{executable: resolved}
-	if info, err := os.Lstat(absolute); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		plan.link = absolute
-	}
-	return plan, nil
+	return binaryRemoval{executable: resolved}, nil
 }
 
 func runUninstall(ctx context.Context, opts uninstallOptions) error {
+	var report cleanupReport
+	defer report.print(opts.out)
+	fail := func(err error) error { report.failed = append(report.failed, err.Error()); return err }
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	service := opts.service
 	if service == nil {
 		service = defaultService()
 	}
-	plistPath := service.plistPath(home)
-	configPaths := []string{defaultConfigPath(), opts.configPath}
-	if installed, err := installedConfigPath(plistPath); err != nil {
-		return err
-	} else if installed != "" {
-		// A custom config may live among unrelated user files. Only remove the
-		// exact file recorded by this service, and require it to be a repo-sync config.
-		if filepath.Clean(installed) != filepath.Clean(defaultConfigPath()) && filepath.Clean(installed) != filepath.Clean(opts.configPath) {
-			if _, err := loadConfig(installed); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("cannot verify custom config %s: %w; use --config explicitly to remove it", installed, err)
-			}
-		}
-		configPaths = append(configPaths, installed)
+	plan, err := buildCleanupPlan(home, opts, service)
+	report.preserved = append(report.preserved, plan.preserved...)
+	if err != nil {
+		return fail(err)
 	}
-	files := []string{plistPath, filepath.Join(home, "Library", "Logs", "repo-sync", "stdout.log"), filepath.Join(home, "Library", "Logs", "repo-sync", "stderr.log")}
-	uniqueConfigs := make(map[string]bool)
-	for _, path := range configPaths {
-		if path == "" {
-			continue
-		}
-		absolute, err := filepath.Abs(path)
-		if err != nil {
-			return err
-		}
-		uniqueConfigs[absolute] = true
-		files = append(files, absolute, statusPath(absolute))
+	discover := opts.discoverProcesses
+	if discover == nil {
+		discover = discoverRepoSyncProcesses
 	}
-	files = uniquePaths(files)
-	for _, path := range files {
-		if err := safeRemovalPath(home, path); err != nil {
-			return err
+	stop := opts.stopProcesses
+	if stop == nil {
+		stop = stopRepoSyncProcesses
+	}
+	processes, err := discover(ctx, plan.executables)
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Fprintln(opts.out, "Uninstall scope: this user's recorded and standard install locations.")
+	fmt.Fprintln(opts.out, "Files to remove:")
+	for _, path := range plan.files {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(opts.out, "  %s\n", path)
 		}
 	}
-	var binary binaryRemoval
+	for _, binary := range plan.binaries {
+		for _, path := range binary.paths {
+			fmt.Fprintf(opts.out, "  %s\n", path)
+		}
+	}
 	if !opts.keepBinary {
-		binary, err = planBinaryRemoval(opts.binary)
-		if err != nil {
-			return err
+		if _, err := os.Lstat(installRecordPath()); err == nil {
+			fmt.Fprintf(opts.out, "  %s\n", installRecordPath())
 		}
 	}
-	fmt.Fprintln(opts.out, "This removes repo-sync's background service and these files:")
-	for _, path := range files {
-		fmt.Fprintf(opts.out, "  %s\n", path)
+	for _, process := range processes {
+		fmt.Fprintf(opts.out, "Stop process: %d (%s)\n", process.PID, process.Executable)
 	}
-	if binary.brew != "" {
-		fmt.Fprintf(opts.out, "Program: Homebrew uninstall %s repo-sync\n", binary.kind)
-	} else if binary.executable != "" {
-		fmt.Fprintf(opts.out, "Program: %s\n", binary.executable)
-	}
-	fmt.Fprintln(opts.out, "Your repositories and shared Git credentials stay in place.")
+	fmt.Fprintln(opts.out, "Repositories, Git history, shared tools, and credentials are preserved.")
 	if !opts.yes {
 		fmt.Fprint(opts.out, "Type yes to uninstall: ")
 		line, err := bufio.NewReader(opts.in).ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
-			return err
+			return fail(err)
 		}
 		if strings.TrimSpace(line) != "yes" {
 			fmt.Fprintln(opts.out, "Uninstall cancelled.")
 			return nil
 		}
 	}
-	before, err := service.inspect(ctx)
-	if err != nil {
-		return err
-	}
-	for path := range uniqueConfigs {
-		data, err := os.ReadFile(statusPath(path))
-		if err != nil {
-			continue
-		}
-		var status serviceStatus
-		if json.Unmarshal(data, &status) == nil && status.PID > 0 && status.PID != before.pid && time.Since(status.UpdatedAt) < 10*time.Second && syscall.Kill(status.PID, 0) == nil {
-			return fmt.Errorf("a foreground repo-sync process is active (PID %d); stop it before uninstalling", status.PID)
-		}
-	}
 	if err := service.stop(ctx); err != nil {
-		return err
+		return fail(err)
 	}
-	// Remove only known files. Never recursively delete a config's parent folder.
-	for _, path := range files {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove %s: %w; service is stopped, rerun uninstall to finish", path, err)
-		}
+	if err := stop(ctx, processes, 45*time.Second); err != nil {
+		return fail(err)
 	}
-	for _, dir := range []string{filepath.Dir(defaultConfigPath()), filepath.Join(home, "Library", "Logs", "repo-sync"), filepath.Join(home, "Library", "Caches", "repo-sync")} {
-		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
-			return err
-		}
+	if remaining, err := discover(ctx, plan.executables); err != nil {
+		return fail(err)
+	} else if len(remaining) > 0 {
+		return fail(fmt.Errorf("repo-sync processes are still running; no files were removed"))
 	}
-	if binary.brew != "" {
-		// Do not use --zap: we already removed our exact files, while zap may erase
-		// unrelated files a user placed in the same directory.
-		if _, err := service.runner.run(ctx, "", "", binary.brew, "uninstall", binary.kind, "repo-sync"); err != nil {
-			return fmt.Errorf("service and data removed, but Homebrew removal failed: %w; run `%s uninstall %s repo-sync`", err, binary.brew, binary.kind)
-		}
-	} else if binary.executable != "" {
-		if binary.link != "" {
-			if err := os.Remove(binary.link); err != nil {
-				return err
+	// A process may finish a write while the user confirms or shutdown is pending.
+	if err := scanCleanupArtifacts(home, service, &plan); err != nil {
+		return fail(err)
+	}
+	report.preserved = append(report.preserved, plan.preserved...)
+	// Save discoveries before deleting the plist, so a partial uninstall can be retried.
+	if err := writeInstallRecord(plan.record); err != nil {
+		return fail(fmt.Errorf("save cleanup record: %w", err))
+	}
+	for _, path := range plan.files {
+		report.remove(path)
+	}
+	report.verify(plan.files)
+	for _, dir := range appDirectories(home)[1:] {
+		report.removeEmptyDirectory(dir)
+	}
+	if state, err := service.inspect(ctx); err != nil {
+		report.failed = append(report.failed, err.Error())
+	} else if state.loaded {
+		report.failed = append(report.failed, "background service is still registered")
+	}
+	if remaining, err := discover(ctx, plan.executables); err != nil {
+		report.failed = append(report.failed, err.Error())
+	} else if len(remaining) > 0 {
+		report.failed = append(report.failed, "repo-sync processes restarted during cleanup")
+	}
+	// Keep the program available for retry if any data could not be removed.
+	if len(report.failed) == 0 {
+		for _, binary := range plan.binaries {
+			removeBinary(ctx, service.runner, binary, &report)
+			if len(report.failed) > 0 {
+				break
 			}
 		}
-		if err := os.Remove(binary.executable); err != nil {
-			return fmt.Errorf("service and data removed, but remove program: %w", err)
+	}
+	// Verify the namespace again, including anything a package hook recreated.
+	if err := scanCleanupArtifacts(home, service, &plan); err != nil {
+		report.failed = append(report.failed, err.Error())
+	}
+	report.preserved = append(report.preserved, plan.preserved...)
+	report.verify(plan.files)
+	for _, dir := range appDirectories(home)[1:] {
+		report.removeEmptyDirectory(dir)
+	}
+	if len(report.failed) == 0 {
+		if opts.keepBinary {
+			plan.record.ConfigPaths = nil
+			if err := writeInstallRecord(plan.record); err != nil {
+				report.failed = append(report.failed, err.Error())
+			} else {
+				report.preserved = append(report.preserved, installRecordPath()+" (tracks retained binaries)")
+			}
+		} else {
+			report.remove(installRecordPath())
+			report.verify([]string{installRecordPath()})
 		}
+	}
+	report.removeEmptyDirectory(filepath.Dir(installRecordPath()))
+	if len(report.failed) > 0 {
+		if _, err := os.Stat(installRecordPath()); errors.Is(err, os.ErrNotExist) {
+			if err := writeInstallRecord(plan.record); err != nil {
+				report.failed = append(report.failed, fmt.Sprintf("retain cleanup record: %v", err))
+			}
+		}
+		if _, err := os.Stat(installRecordPath()); err == nil {
+			report.preserved = append(report.preserved, installRecordPath()+" (needed to retry cleanup)")
+		}
+		for _, binary := range plan.binaries {
+			for _, path := range binary.paths {
+				if _, err := os.Lstat(path); err == nil {
+					report.preserved = append(report.preserved, path+" (cleanup incomplete)")
+				}
+			}
+		}
+		return fmt.Errorf("uninstall incomplete: %s", strings.Join(report.failed, "; "))
 	}
 	fmt.Fprintln(opts.out, "repo-sync uninstalled.")
 	return nil
+}
+
+func removeBinary(ctx context.Context, runner commandRunner, binary binaryRemoval, report *cleanupReport) {
+	for _, alias := range binary.aliases {
+		if err := alias.verify(); err != nil {
+			report.failed = append(report.failed, err.Error())
+			return
+		}
+	}
+	for _, path := range binary.paths {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if !isRepoSyncBinary(path) {
+			report.failed = append(report.failed, path+" (executable changed; preserved)")
+			return
+		}
+	}
+	if binary.brew != "" {
+		args := []string{"uninstall", binary.kind}
+		if binary.kind == "--formula" {
+			args = append(args, "--force")
+		}
+		args = append(args, "repo-sync")
+		if _, err := runner.run(ctx, "", "", binary.brew, args...); err != nil {
+			report.failed = append(report.failed, fmt.Sprintf("Homebrew removal failed: %v; run `%s %s`", err, binary.brew, strings.Join(args, " ")))
+			return
+		}
+		removeBinaryAliases(binary.aliases, report)
+		report.verify(binary.paths)
+		for _, path := range binary.paths {
+			if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+				report.removed = append(report.removed, path)
+			}
+		}
+		return
+	}
+	// Remove symlink aliases individually, then the executable itself.
+	before := len(report.failed)
+	removeBinaryAliases(binary.aliases, report)
+	if len(report.failed) != before {
+		return
+	}
+	if binary.executable != "" {
+		report.remove(binary.executable)
+	}
+	report.verify(binary.paths)
 }
 
 func uniquePaths(paths []string) []string {
@@ -219,23 +301,23 @@ func safeRemovalPath(home, path string) error {
 	return nil
 }
 
-func installedConfigPath(path string) (string, error) {
+func installedArguments(path string) ([]string, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
+		return nil, nil
 	}
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer file.Close()
 	decoder := xml.NewDecoder(file)
 	for {
 		token, err := decoder.Token()
 		if errors.Is(err, io.EOF) {
-			return "", nil
+			return nil, nil
 		}
 		if err != nil {
-			return "", fmt.Errorf("read installed service: %w", err)
+			return nil, fmt.Errorf("read installed service: %w", err)
 		}
 		start, ok := token.(xml.StartElement)
 		if !ok || start.Name.Local != "key" {
@@ -243,7 +325,7 @@ func installedConfigPath(path string) (string, error) {
 		}
 		var key string
 		if err := decoder.DecodeElement(&key, &start); err != nil {
-			return "", err
+			return nil, err
 		}
 		if key != "ProgramArguments" {
 			continue
@@ -251,7 +333,7 @@ func installedConfigPath(path string) (string, error) {
 		for {
 			token, err = decoder.Token()
 			if err != nil {
-				return "", err
+				return nil, err
 			}
 			start, ok = token.(xml.StartElement)
 			if ok {
@@ -262,16 +344,24 @@ func installedConfigPath(path string) (string, error) {
 			Args []string `xml:"string"`
 		}
 		if err := decoder.DecodeElement(&array, &start); err != nil {
-			return "", err
+			return nil, err
 		}
-		for i, arg := range array.Args {
-			if arg == "--config" && i+1 < len(array.Args) {
-				return array.Args[i+1], nil
-			}
-			if strings.HasPrefix(arg, "--config=") {
-				return strings.TrimPrefix(arg, "--config="), nil
-			}
-		}
-		return "", nil
+		return array.Args, nil
 	}
+}
+
+func installedConfigPath(path string) (string, error) {
+	args, err := installedArguments(path)
+	if err != nil {
+		return "", err
+	}
+	for i, arg := range args {
+		if arg == "--config" && i+1 < len(args) {
+			return args[i+1], nil
+		}
+		if strings.HasPrefix(arg, "--config=") {
+			return strings.TrimPrefix(arg, "--config="), nil
+		}
+	}
+	return "", nil
 }

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLaunchAgentPlist(t *testing.T) {
@@ -83,6 +85,184 @@ func TestRunSetupIsRepeatableAndKeepsExistingConfig(t *testing.T) {
 	if !strings.Contains(out.String(), "notes (already synced)") || !strings.Contains(out.String(), "1. blog") {
 		t.Fatalf("second run must list the remaining repo and mark the synced one:\n%s", out.String())
 	}
+}
+
+func TestSetupRecordsCurrentAndPreviousCustomConfigs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	_, repo := makeGitFixture(t)
+	cfg := newDefaultConfig()
+	cfg.Repositories = []repoConfig{{Name: "notes", Path: repo, Remote: "origin"}}
+	oldConfig := filepath.Join(home, "old", "sync.json")
+	newConfig := filepath.Join(home, "new", "sync.json")
+	for _, path := range []string{oldConfig, newConfig} {
+		if err := writeConfig(path, cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
+	if err := writeFileAtomic(plistPath, []byte(launchAgentPlist("/old/repo-sync", oldConfig, filepath.Join(home, "logs"))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := runSetup(context.Background(), setupOptions{configPath: newConfig, binary: "/new/repo-sync", noLaunch: true, in: strings.NewReader("\n"), out: &strings.Builder{}, runner: execCommandRunner{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(defaultConfigPath()), "install.json"))
+	if err != nil {
+		t.Fatalf("setup must save ownership for complete uninstall: %v", err)
+	}
+	var record struct {
+		Version     int      `json:"version"`
+		ConfigPaths []string `json:"config_paths"`
+		BinaryPaths []string `json:"binary_paths"`
+	}
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Version != 1 || !slices.Equal(record.ConfigPaths, uniquePaths([]string{oldConfig, newConfig})) || !slices.Equal(record.BinaryPaths, []string{"/new/repo-sync", "/old/repo-sync"}) {
+		t.Fatalf("setup must retain old config and binary paths without duplicates: %+v", record)
+	}
+}
+
+func TestSetupRejectsMalformedRecordBeforeChangingFilesOrService(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configPath := defaultConfigPath()
+	if err := writeConfig(configPath, newDefaultConfig()); err != nil {
+		t.Fatal(err)
+	}
+	plistPath := defaultService().plistPath(home)
+	oldPlist := launchAgentPlist("/old/repo-sync", configPath, filepath.Join(home, "logs"))
+	if err := writeFileAtomic(plistPath, []byte(oldPlist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(installRecordPath(), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeConfig := readPreflightFile(t, configPath)
+	runner := &lifecycleRunner{loaded: true}
+	toolCalls := 0
+	gitRunner := preflightRunnerFunc(func(_ context.Context, _, _, _ string, _ ...string) (string, error) {
+		toolCalls++
+		return "", errors.New("unexpected tool call")
+	})
+	err := runSetup(context.Background(), setupOptions{configPath: configPath, binary: "/new/repo-sync", in: strings.NewReader("\n"), out: &strings.Builder{}, runner: gitRunner, service: fakeService(runner)})
+	if err == nil || !strings.Contains(err.Error(), "installation record") || toolCalls != 0 || !runner.loaded || runner.starts != 0 {
+		t.Fatalf("invalid record must fail before touching tools or service: %v; calls=%d; runner=%+v", err, toolCalls, runner)
+	}
+	if string(readPreflightFile(t, configPath)) != string(beforeConfig) || string(readPreflightFile(t, plistPath)) != oldPlist || string(readPreflightFile(t, installRecordPath())) != "{broken" {
+		t.Fatal("setup changed files despite malformed ownership record")
+	}
+}
+
+func TestSetupCommitsRecordAfterServiceReadiness(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, repo := makeGitFixture(t)
+	cfg := newDefaultConfig()
+	cfg.Repositories = []repoConfig{{Name: "notes", Path: repo, Remote: "origin"}}
+	configPath := defaultConfigPath()
+	if err := writeConfig(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	runner := &lifecycleRunner{}
+	service := setupOwnershipReadyService(t, runner, configPath, func() {
+		if _, err := os.Stat(installRecordPath()); !os.IsNotExist(err) {
+			t.Fatalf("record committed before service readiness: %v", err)
+		}
+	})
+	if err := runSetup(context.Background(), setupOptions{configPath: configPath, binary: "/new/repo-sync", in: strings.NewReader("\n"), out: &strings.Builder{}, runner: execCommandRunner{}, service: service}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := loadInstallRecord()
+	if err != nil || !slices.Equal(record.ConfigPaths, []string{configPath}) || !slices.Equal(record.BinaryPaths, []string{"/new/repo-sync"}) {
+		t.Fatalf("ready setup did not commit installation record: %+v, %v", record, err)
+	}
+}
+
+func TestSetupRestoresRecordFilesAndServiceWhenRecordingFails(t *testing.T) {
+	for _, existingRecord := range []bool{false, true} {
+		t.Run(map[bool]string{false: "first record", true: "existing record"}[existingRecord], func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			_, repo := makeGitFixture(t)
+			cfg := newDefaultConfig()
+			cfg.Repositories = []repoConfig{{Name: "notes", Path: repo, Remote: "origin"}}
+			configPath := defaultConfigPath()
+			oldConfig, _ := json.Marshal(cfg)
+			if err := writeFileAtomic(configPath, oldConfig, 0o640); err != nil {
+				t.Fatal(err)
+			}
+			plistPath := defaultService().plistPath(home)
+			oldPlist := launchAgentPlist("/old/repo-sync", configPath, filepath.Join(home, "logs"))
+			if err := writeFileAtomic(plistPath, []byte(oldPlist), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var oldRecord []byte
+			if existingRecord {
+				if err := recordInstallation(configPath, "/old/repo-sync"); err != nil {
+					t.Fatal(err)
+				}
+				oldRecord = readPreflightFile(t, installRecordPath())
+			}
+			sentinel := filepath.Join(home, "unrelated.txt")
+			if err := os.WriteFile(sentinel, []byte("keep me"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runner := &lifecycleRunner{loaded: true}
+			service := setupOwnershipReadyService(t, runner, configPath, func() {
+				if existingRecord {
+					if err := os.Remove(installRecordPath()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.Symlink(sentinel, installRecordPath()); err != nil {
+					t.Fatal(err)
+				}
+			})
+			err := runSetup(context.Background(), setupOptions{configPath: configPath, binary: "/new/repo-sync", in: strings.NewReader("\n"), out: &strings.Builder{}, runner: execCommandRunner{}, service: service})
+			if err == nil || !strings.Contains(err.Error(), "write installation record") || !strings.Contains(err.Error(), "previous setup restored") {
+				t.Fatalf("recording failure must roll setup back: %v", err)
+			}
+			if !runner.loaded || runner.starts != 2 || string(readPreflightFile(t, configPath)) != string(oldConfig) || string(readPreflightFile(t, plistPath)) != oldPlist || string(readPreflightFile(t, sentinel)) != "keep me" {
+				t.Fatalf("previous files/service were not restored: %+v", runner)
+			}
+			if existingRecord {
+				if string(readPreflightFile(t, installRecordPath())) != string(oldRecord) {
+					t.Fatal("previous record was not restored")
+				}
+			} else if _, err := os.Lstat(installRecordPath()); !os.IsNotExist(err) {
+				t.Fatalf("failed first setup left an installation record: %v", err)
+			}
+			if info, err := os.Stat(configPath); err != nil || info.Mode().Perm() != 0o640 {
+				t.Fatalf("config permissions were not restored: %v, %v", info, err)
+			}
+		})
+	}
+}
+
+func setupOwnershipReadyService(t *testing.T, runner *lifecycleRunner, configPath string, onFirstStart func()) *launchService {
+	t.Helper()
+	return &launchService{domain: "gui/test", label: launchAgentLabel, runner: preflightRunnerFunc(func(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
+		output, err := runner.run(ctx, dir, stdin, name, args...)
+		if err == nil && args[0] == "bootstrap" && runner.starts == 1 {
+			runner.pid = 99999999
+			onFirstStart()
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(serviceStatus{PID: runner.pid, ConfigHash: configHash(cfg), UpdatedAt: time.Now()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writeFileAtomic(statusPath(configPath), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return output, err
+	})}
 }
 
 func TestRunSetupRejectsRepoThatDaemonCannotFetch(t *testing.T) {

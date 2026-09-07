@@ -116,7 +116,7 @@ func TestLaunchdInstallSyncRestartAndUninstall(t *testing.T) {
 	if installed, err := installedConfigPath(service.plistPath(home)); err != nil || installed != configPath {
 		t.Fatalf("previous plist not restored: %s %v", installed, err)
 	}
-	if err := runUninstall(context.Background(), uninstallOptions{configPath: configPath, binary: binary, yes: true, in: strings.NewReader(""), out: &out, service: service}); err != nil {
+	if err := runUninstall(context.Background(), uninstallOptions{binaryPaths: []string{}, configPath: configPath, binary: binary, yes: true, in: strings.NewReader(""), out: &out, service: service}); err != nil {
 		t.Fatalf("uninstall: %v\n%s", err, out.String())
 	}
 	final, err := service.inspect(context.Background())

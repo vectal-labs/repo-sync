@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -19,6 +21,7 @@ type uninstallRunner struct {
 	stopError error
 	brewError error
 	calls     [][]string
+	brewPaths []string
 }
 
 func (r *uninstallRunner) run(_ context.Context, _, _, name string, args ...string) (string, error) {
@@ -39,7 +42,20 @@ func (r *uninstallRunner) run(_ context.Context, _, _, name string, args ...stri
 		}
 	}
 	if filepath.Base(name) == "brew" {
-		return "", r.brewError
+		if r.brewError != nil {
+			return "", r.brewError
+		}
+		for _, path := range r.brewPaths {
+			if _, err := os.Lstat(path); err != nil {
+				return "", fmt.Errorf("binary removed before package manager: %w", err)
+			}
+		}
+		for _, path := range r.brewPaths {
+			if err := os.Remove(path); err != nil {
+				return "", err
+			}
+		}
+		return "", nil
 	}
 	return "", fmt.Errorf("unexpected command: %s %v", name, args)
 }
@@ -59,6 +75,7 @@ type uninstallFixture struct {
 
 func newUninstallFixture(t *testing.T) uninstallFixture {
 	t.Helper()
+	binaryData := uninstallBinaryBytes(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	runner := &uninstallRunner{label: "test.repo-sync.uninstall", loaded: true}
@@ -88,7 +105,7 @@ func newUninstallFixture(t *testing.T) uninstallFixture {
 	if err := writeConfig(f.config, cfg); err != nil {
 		t.Fatal(err)
 	}
-	uninstallWrite(t, f.binary, "standalone executable\n", 0o755)
+	uninstallWrite(t, f.binary, string(binaryData), 0o755)
 	uninstallWrite(t, f.plist, launchAgentPlist(f.binary, f.config, f.logs), 0o644)
 	uninstallWrite(t, statusPath(f.config), "{\"pid\":0}\n", 0o600)
 	uninstallWrite(t, filepath.Join(f.logs, "stdout.log"), "ordinary output\n", 0o600)
@@ -136,7 +153,9 @@ func (f uninstallFixture) assertUserFilesPreserved(t *testing.T) {
 }
 
 func (f uninstallFixture) options(out *strings.Builder) uninstallOptions {
-	return uninstallOptions{configPath: f.config, binary: f.binary, yes: true, in: strings.NewReader(""), out: out, service: f.service}
+	return uninstallOptions{configPath: f.config, binary: f.binary, yes: true, in: strings.NewReader(""), out: out, service: f.service,
+		binaryPaths: []string{}, discoverProcesses: func(context.Context, []string) ([]ownedProcess, error) { return nil, nil }, stopProcesses: func(context.Context, []ownedProcess, time.Duration) error { return nil }}
+
 }
 
 func TestUninstallCancelPreservesInstallation(t *testing.T) {
@@ -230,6 +249,44 @@ func TestUninstallStopFailurePreservesInstallation(t *testing.T) {
 	}
 }
 
+func TestUninstallRemovesFilesCreatedDuringShutdown(t *testing.T) {
+	f := newUninstallFixture(t)
+	lateCache := filepath.Join(f.home, "Library", "Caches", "repo-sync", "status-"+strings.Repeat("a", 64)+".json")
+	lateTemporary := filepath.Join(filepath.Dir(f.config), ".repo-sync-987654")
+	var out strings.Builder
+	opts := f.options(&out)
+	opts.stopProcesses = func(context.Context, []ownedProcess, time.Duration) error {
+		uninstallWrite(t, lateCache, "{}", 0o600)
+		uninstallWrite(t, lateTemporary, "partial write", 0o600)
+		return nil
+	}
+	if err := runUninstall(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	uninstallAssertMissing(t, append(f.installed, lateCache, lateTemporary, installRecordPath())...)
+	f.assertUserFilesPreserved(t)
+}
+
+func TestUninstallHomebrewMustActuallyRemoveProgram(t *testing.T) {
+	f := newUninstallFixture(t)
+	prefix := filepath.Join(f.home, "homebrew")
+	brew := filepath.Join(prefix, "bin", "brew")
+	binary := filepath.Join(prefix, "Caskroom", "repo-sync", "1.0.0", "repo-sync")
+	uninstallWrite(t, brew, "fake brew; never execute", 0o755)
+	uninstallWrite(t, binary, string(uninstallBinaryBytes(t)), 0o755)
+	// No brewPaths: this package manager claims success without removing files.
+	var out strings.Builder
+	opts := f.options(&out)
+	opts.binary = binary
+	if err := runUninstall(context.Background(), opts); err == nil {
+		t.Fatal("package manager success must be checked against remaining files")
+	}
+	uninstallAssertPresent(t, binary, installRecordPath())
+	if strings.Contains(out.String(), "repo-sync uninstalled.") {
+		t.Fatal("leftover binaries must not report successful removal")
+	}
+}
+
 func TestUninstallRefusesSymlinkedApplicationDirectory(t *testing.T) {
 	f := newUninstallFixture(t)
 	appDir := filepath.Dir(f.config)
@@ -289,7 +346,7 @@ func TestUninstallStandaloneThroughParentAlias(t *testing.T) {
 	f.assertUserFilesPreserved(t)
 }
 
-func TestUninstallRefusesActiveForegroundProcess(t *testing.T) {
+func TestUninstallDoesNotTrustStatusPIDToIdentifyProcesses(t *testing.T) {
 	f := newUninstallFixture(t)
 	f.runner.loaded = false
 	status, err := json.Marshal(serviceStatus{PID: os.Getpid(), UpdatedAt: time.Now()})
@@ -298,12 +355,16 @@ func TestUninstallRefusesActiveForegroundProcess(t *testing.T) {
 	}
 	uninstallWrite(t, statusPath(f.config), string(status), 0o600)
 	var out strings.Builder
-	err = runUninstall(context.Background(), f.options(&out))
-	if err == nil || !strings.Contains(err.Error(), "foreground repo-sync process is active") {
-		t.Fatalf("must ask user to stop active foreground process, got %v", err)
+	opts := f.options(&out)
+	// The actual process scanner must reject this PID: it is a Go test process,
+	// and its executable is not one of this installation's verified binaries.
+	opts.discoverProcesses = discoverRepoSyncProcesses
+	opts.stopProcesses = stopRepoSyncProcesses
+	if err := runUninstall(context.Background(), opts); err != nil {
+		t.Fatal(err)
 	}
-	uninstallAssertPresent(t, f.installed...)
 	f.assertUserFilesPreserved(t)
+	uninstallAssertMissing(t, f.installed...)
 }
 
 func TestUninstallHomebrewUsesPackageManager(t *testing.T) {
@@ -314,7 +375,7 @@ func TestUninstallHomebrewUsesPackageManager(t *testing.T) {
 			brew := filepath.Join(prefix, "bin", "brew")
 			binary := filepath.Join(prefix, test.directory, "repo-sync", "1.0.0", "repo-sync")
 			uninstallWrite(t, brew, "fake brew; never execute", 0o755)
-			uninstallWrite(t, binary, "package-owned binary", 0o755)
+			uninstallWrite(t, binary, string(uninstallBinaryBytes(t)), 0o755)
 			link := filepath.Join(prefix, "bin", "repo-sync")
 			if err := os.Symlink(binary, link); err != nil {
 				t.Fatal(err)
@@ -322,6 +383,7 @@ func TestUninstallHomebrewUsesPackageManager(t *testing.T) {
 			var out strings.Builder
 			opts := f.options(&out)
 			opts.binary = link
+			f.runner.brewPaths = []string{binary, link}
 			if err := runUninstall(context.Background(), opts); err != nil {
 				t.Fatal(err)
 			}
@@ -329,14 +391,25 @@ func TestUninstallHomebrewUsesPackageManager(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := []string{resolvedBrew, "uninstall", test.kind, "repo-sync"}
-			if len(f.runner.calls) == 0 || !reflect.DeepEqual(f.runner.calls[len(f.runner.calls)-1], want) {
+			want := []string{resolvedBrew, "uninstall", test.kind}
+			if test.kind == "--formula" {
+				want = append(want, "--force")
+			}
+			want = append(want, "repo-sync")
+			found := false
+			for _, call := range f.runner.calls {
+				if reflect.DeepEqual(call, want) {
+					found = true
+				}
+			}
+			if !found {
 				t.Fatalf("Homebrew must own binary removal: calls=%v want=%v", f.runner.calls, want)
 			}
 			uninstallAssertMissing(t, f.installed[1:]...)
-			// The fake package manager does not remove its files. Direct deletion
-			// here would bypass the package manager's ownership bookkeeping.
-			uninstallAssertPresent(t, binary, link, brew)
+			// The fake package manager asserts that both files still existed when
+			// it was invoked, then removes them. Cleanup verifies its result.
+			uninstallAssertMissing(t, binary, link)
+			uninstallAssertPresent(t, brew)
 			f.assertUserFilesPreserved(t)
 		})
 	}
@@ -348,7 +421,7 @@ func TestUninstallHomebrewFailureReportsRemainingProgram(t *testing.T) {
 	brew := filepath.Join(prefix, "bin", "brew")
 	binary := filepath.Join(prefix, "Caskroom", "repo-sync", "1.0.0", "repo-sync")
 	uninstallWrite(t, brew, "fake brew; never execute", 0o755)
-	uninstallWrite(t, binary, "package-owned binary", 0o755)
+	uninstallWrite(t, binary, string(uninstallBinaryBytes(t)), 0o755)
 	f.runner.brewError = errors.New("package database is locked")
 	var out strings.Builder
 	opts := f.options(&out)
@@ -368,7 +441,7 @@ func TestUninstallHomebrewFailureReportsRemainingProgram(t *testing.T) {
 func TestUninstallMissingHomebrewPreservesInstallation(t *testing.T) {
 	f := newUninstallFixture(t)
 	binary := filepath.Join(f.home, "homebrew", "Caskroom", "repo-sync", "1.0.0", "repo-sync")
-	uninstallWrite(t, binary, "package-owned binary", 0o755)
+	uninstallWrite(t, binary, string(uninstallBinaryBytes(t)), 0o755)
 	var out strings.Builder
 	opts := f.options(&out)
 	opts.binary = binary
@@ -412,4 +485,39 @@ func TestUninstallCustomConfigOutsideHomeThroughMacOSAlias(t *testing.T) {
 	}
 	uninstallAssertMissing(t, custom)
 	f.assertUserFilesPreserved(t)
+}
+
+var uninstallBuildOnce sync.Once
+var uninstallBuiltBytes []byte
+var uninstallBuildErr error
+var uninstallBuildEnvironment = os.Environ()
+
+func uninstallBinaryBytes(t *testing.T) []byte {
+	t.Helper()
+	uninstallBuildOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "repo-sync-uninstall-test-")
+		if err != nil {
+			uninstallBuildErr = err
+			return
+		}
+		defer os.RemoveAll(dir)
+		binary := filepath.Join(dir, "repo-sync")
+		root, err := filepath.Abs("../..")
+		if err != nil {
+			uninstallBuildErr = err
+			return
+		}
+		cmd := exec.Command("go", "build", "-o", binary, ".")
+		cmd.Dir = root
+		cmd.Env = uninstallBuildEnvironment
+		if output, err := cmd.CombinedOutput(); err != nil {
+			uninstallBuildErr = fmt.Errorf("build test executable: %w: %s", err, output)
+			return
+		}
+		uninstallBuiltBytes, uninstallBuildErr = os.ReadFile(binary)
+	})
+	if uninstallBuildErr != nil {
+		t.Fatal(uninstallBuildErr)
+	}
+	return uninstallBuiltBytes
 }

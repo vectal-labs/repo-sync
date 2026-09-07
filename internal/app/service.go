@@ -40,7 +40,9 @@ var launchPID = regexp.MustCompile(`(?m)^\s*pid = ([0-9]+)\s*$`)
 func (s *launchService) inspect(ctx context.Context) (launchState, error) {
 	output, err := s.runner.run(ctx, "", "", "/bin/launchctl", "print", s.target())
 	if err != nil {
-		if strings.Contains(output, "Could not find service") && strings.Contains(output, s.label) {
+		// launchctl writes missing-service diagnostics to stderr, carried by err.
+		diagnostics := output + "\n" + err.Error()
+		if strings.Contains(diagnostics, "Could not find service \""+s.label+"\"") || strings.Contains(diagnostics, "Could not find service "+s.label+"\n") || strings.HasSuffix(diagnostics, "Could not find service "+s.label) {
 			return launchState{}, nil
 		}
 		return launchState{}, fmt.Errorf("check background service: %w", err)
