@@ -95,6 +95,7 @@ func checkRepository(ctx context.Context, runner commandRunner, repo repoConfig)
 		return check
 	}
 	// Newer Git can update the remote HEAD even during a fetch dry-run.
+	// Override it only for this probe so normal fetches retain the user's settings.
 	if _, err := runGit(ctx, runner, repo.Path, "-c", "remote."+repo.Remote+".followRemoteHEAD=never", "fetch", "--dry-run", "--no-write-fetch-head", "--no-auto-maintenance", repo.Remote); err != nil {
 		check.err = fmt.Errorf("fetch failed; check credentials and network access with `git -C %s fetch --dry-run %s`: %w", preflightShellQuote(repo.Path), preflightShellQuote(repo.Remote), err)
 		return check
