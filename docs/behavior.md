@@ -27,7 +27,7 @@
 - allowed: `.env.example`, `.env.sample`, `.env.template`, `.env.dist`.
 - a blocked file is left out. everything else still syncs. you get one notification per file.
 - a blocked file you staged by hand is unstaged so it never reaches the remote.
-- `repo-sync allow <file>` inside the repo overrides the guard for that file. the list is in `secrets.go`.
+- `repo-sync allow <file>` inside the repo overrides the guard for that file. the list is in [`internal/app/secrets.go`](../internal/app/secrets.go).
 
 ## conflicts and failures
 
