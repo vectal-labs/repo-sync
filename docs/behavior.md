@@ -37,6 +37,12 @@
 
 - only the remote's default branch is synced. it is read from `origin/HEAD`, with `main` as fallback.
 - on a feature branch or detached head the checkout is left untouched and the cycle is skipped. it never switches branches.
+- while it stages, commits, rebases, and pushes, repo-sync holds git's own `index.lock`, the same lock every git command takes. a `git checkout`, `commit`, `rebase`, or `merge` you run at that moment is refused by git with its usual "index.lock exists" message; run it again a second later. `git status` and other reads keep working.
+- so a branch switch cannot land in the middle of a commit, rebase, or push. between those steps a switch succeeds, the cycle stops there, and it retries later. your new branch and its files are left alone.
+- `git checkout -b` at the current commit is the one switch git allows without that lock. if it slips in, repo-sync undoes what it just did on the new branch and skips the cycle. main and the new branch end up exactly where they were.
+- hooks run as usual and inherit the daemon's index, so a hook could switch branches mid-rebase. after a rebase, HEAD's reflog must show only the rebase itself and every commit main gained must be a replay of one it had. otherwise main and the worktree are restored and nothing is pushed.
+- the daemon never aborts a rebase it did not start. someone else's rebase, merge, or cherry-pick in progress makes it step back.
+- if the daemon is killed hard while holding the lock, `index.lock` stays behind, exactly as after any crashed git command. remove it by hand.
 - if a repo stays off its default branch for 24 hours you get one notification. no nagging.
 - during a merge, rebase, cherry-pick, revert, or bisect it steps back until you are done.
 

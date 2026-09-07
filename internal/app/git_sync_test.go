@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGitSyncCommitsRebasesAndPushes(t *testing.T) {
@@ -322,11 +323,39 @@ type hookedRunner struct {
 }
 
 func (h *hookedRunner) run(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
-	if name == "git" && slices.Contains(args, h.command) && !h.fired {
+	if git := gitArgs(name, args); git != nil && slices.Contains(git, h.command) && !h.fired {
 		h.fired = true
 		h.before()
 	}
 	return h.inner.run(ctx, dir, stdin, name, args...)
+}
+
+// gitArgs returns the git arguments of a command, also when it is run as
+// `env GIT_INDEX_FILE=... git ...`, or nil when it is not git at all.
+func gitArgs(name string, args []string) []string {
+	if name == "git" {
+		return args
+	}
+	if name == "env" {
+		for i, arg := range args {
+			if arg == "git" {
+				return args[i+1:]
+			}
+		}
+	}
+	return nil
+}
+
+// humanGit runs a git command the way a person in a terminal would and
+// returns the failure instead of stopping the test.
+func humanGit(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return errors.New(strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func TestGitSyncSkipsWhenFileVanishesBeforeAdd(t *testing.T) {
@@ -348,7 +377,8 @@ func TestGitSyncSkipsWhenFileVanishesBeforeAdd(t *testing.T) {
 }
 
 func TestGitSyncSkipsWhenWorktreeChangesBeforeRebase(t *testing.T) {
-	_, local := makeGitFixture(t)
+	remote, local := makeGitFixture(t)
+	pushFromTeammate(t, remote, "remote.txt", "remote\n")
 	runner := &hookedRunner{inner: execCommandRunner{}, command: "rebase", before: func() {
 		if err := os.WriteFile(filepath.Join(local, "README.md"), []byte("edited mid-cycle\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -492,25 +522,32 @@ func assertWithheld(t *testing.T, err error, report syncReport, paths ...string)
 	}
 }
 
+// Staging a secret from another process right before the commit is refused
+// outright: repo-sync owns the checkout, so Git rejects the `git add` with
+// its lock message. The secret stays an untracked file and never reaches the
+// remote. (A hook doing the same inherits our index and is covered below.)
 func TestGitSyncHoldsPushWhenSecretIsStagedRightBeforeCommit(t *testing.T) {
 	remote, local := makeGitFixture(t)
 	write(t, local, "public.txt", "public\n")
+	var addErr error
 	runner := &hookedRunner{inner: execCommandRunner{}, command: "commit", before: func() {
 		write(t, local, ".env", "TOKEN=1\n")
-		gitRun(t, local, "add", ".env")
+		addErr = humanGit(local, "add", ".env")
 	}}
 	repo := repoConfig{Name: "notes", Path: local, Remote: "origin"}
 	report, err := gitSyncer{runner: runner}.sync(context.Background(), repo, true)
-	assertWithheld(t, err, report, ".env")
-	if tree := remoteTree(t, local, remote); strings.Contains(tree, ".env") {
-		t.Fatalf(".env reached the remote:\n%s", tree)
+	if err != nil || report.Committed != 1 || !report.Pushed {
+		t.Fatalf("report = %+v, err = %v", report, err)
 	}
-	// Nothing is rewritten or deleted for the user: the commit and file stay.
-	if got := gitOutput(t, local, "show", "--name-only", "--pretty=", "HEAD"); !strings.Contains(got, ".env") {
-		t.Fatalf("local commit was rewritten: %q", got)
+	if addErr == nil || !strings.Contains(addErr.Error(), "index.lock") {
+		t.Fatalf("the concurrent git add must be refused by Git's lock, got: %v", addErr)
 	}
-	if _, err := os.Stat(filepath.Join(local, ".env")); err != nil {
-		t.Fatalf("user file was removed: %v", err)
+	if tree := remoteTree(t, local, remote); strings.Contains(tree, ".env") || !strings.Contains(tree, "public.txt") {
+		t.Fatalf("remote tree:\n%s", tree)
+	}
+	// Nothing is rewritten or deleted for the user: the file stays, untracked.
+	if got := gitOutput(t, local, "status", "--porcelain"); got != "?? .env\n" {
+		t.Fatalf("status = %q", got)
 	}
 }
 
@@ -1281,4 +1318,481 @@ func TestGitSyncKeepsNewerUntrackedEditWhenRebaseIsRefused(t *testing.T) {
 	if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != remoteBefore {
 		t.Fatalf("remote main moved to %s", got)
 	}
+}
+
+// A human runs an ordinary `git checkout feature` while a sync is staging,
+// committing, rebasing, or pushing. Git refuses it: repo-sync owns the
+// checkout for exactly that stretch. The sync finishes on the default branch,
+// feature work is never published, and the feature branch stays as it was.
+func TestGitSyncRefusesCheckoutWhileItOwnsTheCheckout(t *testing.T) {
+	// The push sends the validated commit hash, so the checkout is released
+	// before it: a switch during the push succeeds and changes nothing.
+	for _, step := range []string{"add", "commit", "rebase", "push"} {
+		t.Run("during "+step, func(t *testing.T) {
+			remote, local := makeGitFixture(t)
+			featureTip := makeFeatureBranch(t, local)
+			pushFromTeammate(t, remote, "remote.txt", "remote\n")
+			write(t, local, "mine.txt", "mine\n")
+			var checkoutErr error
+			runner := &hookedRunner{inner: execCommandRunner{}, command: step, before: func() {
+				checkoutErr = humanGit(local, "checkout", "feature")
+			}}
+			report, err := gitSyncer{runner: runner}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+			if err != nil || report.Committed != 1 || !report.Pulled || !report.Pushed {
+				t.Fatalf("report = %+v, err = %v", report, err)
+			}
+			if step == "push" {
+				if checkoutErr != nil {
+					t.Fatalf("the checkout is not owned during the push, got: %v", checkoutErr)
+				}
+				gitRun(t, local, "checkout", "-q", "main")
+			} else if checkoutErr == nil || !strings.Contains(checkoutErr.Error(), "index.lock") {
+				t.Fatalf("the human checkout must be refused by Git's lock, got: %v", checkoutErr)
+			}
+			assertMainSynced(t, remote, local, []string{"README.md", "mine.txt", "remote.txt"})
+			assertFeatureUntouched(t, remote, local, featureTip)
+		})
+	}
+}
+
+// The scenario from the review: a rebase is paused (here by a slow post-commit
+// hook) and a human switches to feature from another terminal. Before the fix
+// the rebase finished with feature history on main and pushed it.
+func TestGitSyncKeepsMainWhenHumanSwitchesDuringRebase(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	featureTip := makeFeatureBranch(t, local)
+	writeAndCommit(t, local, "mine.txt", "mine\n", "main work")
+	pushFromTeammate(t, remote, "remote.txt", "remote\n")
+	gitDir := filepath.Join(local, ".git")
+	hook := "#!/bin/sh\nif test ! -e \"$GIT_DIR_ABS/fired\"; then\n touch \"$GIT_DIR_ABS/fired\" \"$GIT_DIR_ABS/ready\"\n while test ! -e \"$GIT_DIR_ABS/resume\"; do sleep 0.01; done\nfi\n"
+	hook = strings.ReplaceAll(hook, "$GIT_DIR_ABS", gitDir)
+	if err := os.WriteFile(filepath.Join(gitDir, "hooks", "post-commit"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	human := make(chan error, 1)
+	go func() {
+		defer os.WriteFile(filepath.Join(gitDir, "resume"), nil, 0o600)
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(filepath.Join(gitDir, "ready")); err == nil {
+				human <- humanGit(local, "checkout", "feature")
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		human <- errors.New("the rebase never paused")
+	}()
+	report, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, false)
+	if err != nil || !report.Pulled || !report.Pushed {
+		t.Fatalf("report = %+v, err = %v", report, err)
+	}
+	if checkoutErr := <-human; checkoutErr == nil || !strings.Contains(checkoutErr.Error(), "index.lock") {
+		t.Fatalf("the human checkout must be refused by Git's lock, got: %v", checkoutErr)
+	}
+	assertMainSynced(t, remote, local, []string{"README.md", "mine.txt", "remote.txt"})
+	assertFeatureUntouched(t, remote, local, featureTip)
+}
+
+// `git checkout -b` at the current commit is the one switch Git allows without
+// the index lock. If it lands right before our commit, the commit goes to the
+// new branch; repo-sync must notice and put that branch back exactly as it was.
+func TestGitSyncUndoesCommitOnBranchCreatedMidCommit(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	base := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main"))
+	write(t, local, "mine.txt", "mine\n")
+	var statusBefore string
+	runner := &hookedRunner{inner: execCommandRunner{}, command: "commit", before: func() {
+		gitRun(t, local, "checkout", "-b", "feature")
+		statusBefore = gitOutput(t, local, "status", "--porcelain")
+	}}
+	repo := repoConfig{Name: "notes", Path: local, Remote: "origin"}
+	report, err := gitSyncer{runner: runner}.sync(context.Background(), repo, true)
+	var skip *skipError
+	if !errors.As(err, &skip) || !skip.offBranch || report.Committed != 0 || report.Pushed {
+		t.Fatalf("report = %+v, err = %v; want off-branch skip", report, err)
+	}
+	for _, ref := range []string{"main", "feature"} {
+		if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", ref)); got != base {
+			t.Fatalf("%s moved to %s; nothing may be committed anywhere", ref, got)
+		}
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); got != statusBefore {
+		t.Fatalf("index or worktree changed: %q -> %q", statusBefore, got)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != base {
+		t.Fatalf("remote main moved to %s", got)
+	}
+	assertNoLockLeft(t, local)
+
+	// Back on main the edit syncs as usual.
+	gitRun(t, local, "checkout", "main")
+	report, err = gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repo, true)
+	if err != nil || report.Committed != 1 || !report.Pushed {
+		t.Fatalf("retry on main: report = %+v, err = %v", report, err)
+	}
+	assertMainSynced(t, remote, local, []string{"README.md", "mine.txt"})
+}
+
+// The same `git checkout -b` right before the rebase makes Git rebase the new
+// branch. repo-sync restores the branch and the worktree; main is untouched.
+func TestGitSyncUndoesRebaseOnBranchCreatedMidCycle(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	writeAndCommit(t, local, "mine.txt", "mine\n", "main work")
+	tip := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main"))
+	pushFromTeammate(t, remote, "remote.txt", "remote\n")
+	runner := &hookedRunner{inner: execCommandRunner{}, command: "rebase", before: func() {
+		gitRun(t, local, "checkout", "-b", "feature")
+	}}
+	repo := repoConfig{Name: "notes", Path: local, Remote: "origin"}
+	report, err := gitSyncer{runner: runner}.sync(context.Background(), repo, false)
+	var skip *skipError
+	if !errors.As(err, &skip) || !skip.offBranch || report.Pushed {
+		t.Fatalf("report = %+v, err = %v; want off-branch skip", report, err)
+	}
+	for _, ref := range []string{"main", "feature"} {
+		if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", ref)); got != tip {
+			t.Fatalf("%s moved to %s; the rebase must be undone", ref, got)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(local, "remote.txt")); !os.IsNotExist(err) {
+		t.Fatalf("worktree was left rebased: %v", err)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); got != "" {
+		t.Fatalf("worktree is dirty after undo: %q", got)
+	}
+	assertNoLockLeft(t, local)
+
+	gitRun(t, local, "checkout", "main")
+	report, err = gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repo, false)
+	if err != nil || !report.Pushed {
+		t.Fatalf("retry on main: report = %+v, err = %v", report, err)
+	}
+	assertMainSynced(t, remote, local, []string{"README.md", "mine.txt", "remote.txt"})
+}
+
+// A human starts a conflicting rebase at the very moment repo-sync is about
+// to rebase. Git refuses one of the two. Either way, no rebase is aborted that
+// the daemon did not start, and the human's edit survives.
+func TestGitSyncNeverAbortsSomeoneElsesRebase(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	writeAndCommit(t, local, "shared.txt", "local\n", "local work")
+	localTip := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main"))
+	pushFromTeammate(t, remote, "shared.txt", "remote\n")
+	var rebaseErr error
+	runner := &hookedRunner{inner: execCommandRunner{}, command: "rebase", before: func() {
+		rebaseErr = humanGit(local, "rebase", "origin/main")
+		write(t, local, "shared.txt", "human partial resolution\n")
+	}}
+	_, err := gitSyncer{runner: runner}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, false)
+	var skip *skipError
+	if !errors.As(err, &skip) {
+		t.Fatalf("error = %v, want a skip", err)
+	}
+	if rebaseErr == nil || !strings.Contains(rebaseErr.Error(), "index.lock") {
+		t.Fatalf("the human rebase must be refused by Git's lock, got: %v", rebaseErr)
+	}
+	if data, _ := os.ReadFile(filepath.Join(local, "shared.txt")); string(data) != "human partial resolution\n" {
+		t.Fatalf("the human's edit was discarded: %q", data)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main")); got != localTip {
+		t.Fatalf("main moved to %s", got)
+	}
+	if _, err := os.Stat(filepath.Join(local, ".git", "rebase-merge")); !os.IsNotExist(err) {
+		t.Fatalf("a rebase was left in progress: %v", err)
+	}
+	assertNoLockLeft(t, local)
+}
+
+// Another Git process holds the index lock: repo-sync waits its turn and must
+// not remove a lock it does not own.
+func TestGitSyncSkipsWhileAnotherGitProcessHoldsTheIndex(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	write(t, local, "mine.txt", "mine\n")
+	lock := filepath.Join(local, ".git", "index.lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+	var skip *skipError
+	if !errors.As(err, &skip) || !strings.Contains(skip.reason, "index.lock") || report.Committed != 0 {
+		t.Fatalf("report = %+v, err = %v; want a lock skip", report, err)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("someone else's lock was removed: %v", err)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); !strings.Contains(got, "?? mine.txt") {
+		t.Fatalf("worktree was touched: %q", got)
+	}
+	if tree := gitOutput(t, local, "--git-dir", remote, "ls-tree", "-r", "--name-only", "main"); strings.Contains(tree, "mine.txt") {
+		t.Fatal("nothing may be pushed while the checkout is in use")
+	}
+}
+
+// A local branch named "origin/main" must never be mistaken for the remote.
+func TestGitSyncUsesFullRemoteRefName(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	gitRun(t, local, "checkout", "-b", "origin/main")
+	writeAndCommit(t, local, "feature-only.txt", "unfinished feature\n", "feature work")
+	gitRun(t, local, "checkout", "main")
+	pushFromTeammate(t, remote, "remote.txt", "remote\n")
+	write(t, local, "mine.txt", "mine\n")
+	report, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+	if err != nil || !report.Pulled || !report.Pushed {
+		t.Fatalf("report = %+v, err = %v", report, err)
+	}
+	assertMainSynced(t, remote, local, []string{"README.md", "mine.txt", "remote.txt"})
+}
+
+// Between operations the checkout is not owned, so a human switch succeeds.
+// The cycle then stops without touching the new branch, and syncs again once
+// the human is back on the default branch.
+func TestGitSyncStopsWhenBranchChangesBetweenOperations(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	write(t, local, "mine.txt", "mine\n")
+	var featureTip string
+	runner := &hookedRunner{inner: execCommandRunner{}, command: "fetch", before: func() {
+		featureTip = makeFeatureBranch(t, local)
+		gitRun(t, local, "checkout", "feature")
+	}}
+	repo := repoConfig{Name: "notes", Path: local, Remote: "origin"}
+	report, err := gitSyncer{runner: runner}.sync(context.Background(), repo, true)
+	var skip *skipError
+	if !errors.As(err, &skip) || !skip.offBranch || !strings.Contains(skip.reason, "branch is feature") {
+		t.Fatalf("error = %v, report = %+v; want off-branch skip", err, report)
+	}
+	if report.Committed != 1 || report.Pushed {
+		t.Fatalf("report = %+v; the commit on main must stay local", report)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "branch", "--show-current")); got != "feature" {
+		t.Fatalf("branch was switched to %q", got)
+	}
+	assertFeatureUntouched(t, remote, local, featureTip)
+	assertNoLockLeft(t, local)
+
+	gitRun(t, local, "checkout", "main")
+	report, err = gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repo, true)
+	if err != nil || !report.Pushed {
+		t.Fatalf("retry on main: report = %+v, err = %v", report, err)
+	}
+	assertMainSynced(t, remote, local, []string{"README.md", "mine.txt"})
+	assertFeatureUntouched(t, remote, local, featureTip)
+}
+
+// makeFeatureBranch creates a feature branch with its own file, returns its
+// commit, and goes back to main.
+func makeFeatureBranch(t *testing.T, local string) string {
+	t.Helper()
+	gitRun(t, local, "checkout", "-q", "-b", "feature")
+	writeAndCommit(t, local, "feature-only.txt", "unfinished feature\n", "feature work")
+	tip := strings.TrimSpace(gitOutput(t, local, "rev-parse", "feature"))
+	gitRun(t, local, "checkout", "-q", "main")
+	return tip
+}
+
+// pushFromTeammate lands a commit on the remote's main from a second clone.
+func pushFromTeammate(t *testing.T, remote, name, contents string) {
+	t.Helper()
+	other := filepath.Join(t.TempDir(), "other")
+	gitRun(t, "", "clone", "-q", remote, other)
+	configureGitUser(t, other)
+	writeAndCommit(t, other, name, contents, "teammate: "+name)
+	gitRun(t, other, "push", "-q", "origin", "main")
+}
+
+func assertMainSynced(t *testing.T, remote, local string, files []string) {
+	t.Helper()
+	if got := strings.Fields(gitOutput(t, local, "--git-dir", remote, "ls-tree", "-r", "--name-only", "main")); !reflect.DeepEqual(got, files) {
+		t.Fatalf("remote main files = %v, want %v", got, files)
+	}
+	if remoteMain, localMain := gitOutput(t, local, "--git-dir", remote, "rev-parse", "main"), gitOutput(t, local, "rev-parse", "main"); remoteMain != localMain {
+		t.Fatalf("remote main = %s, local main = %s", remoteMain, localMain)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "branch", "--show-current")); got != "main" {
+		t.Fatalf("checkout ended on %q", got)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); got != "" {
+		t.Fatalf("worktree or index is dirty after sync: %q", got)
+	}
+	assertNoLockLeft(t, local)
+}
+
+func assertFeatureUntouched(t *testing.T, remote, local, featureTip string) {
+	t.Helper()
+	if tree := gitOutput(t, local, "--git-dir", remote, "ls-tree", "-r", "--name-only", "main"); strings.Contains(tree, "feature-only.txt") {
+		t.Fatalf("feature work reached remote main:\n%s", tree)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", "feature")); got != featureTip {
+		t.Fatalf("feature branch moved from %s to %s", featureTip, got)
+	}
+	if got := gitOutput(t, local, "show", "feature:feature-only.txt"); got != "unfinished feature\n" {
+		t.Fatalf("feature file changed: %q", got)
+	}
+	if output := gitOutput(t, local, "--git-dir", remote, "branch", "--list", "feature"); strings.TrimSpace(output) != "" {
+		t.Fatalf("feature branch was published: %q", output)
+	}
+}
+
+func assertNoLockLeft(t *testing.T, local string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(local, ".git", "index.lock")); !os.IsNotExist(err) {
+		t.Fatalf("index.lock was left behind: %v", err)
+	}
+}
+
+// A hook that switches branches in the middle of the rebase inherits our
+// index file and gets past the lock. The rebase then finishes with foreign
+// history on main. repo-sync must detect it, restore main, and publish nothing.
+func TestGitSyncRestoresMainWhenHookSwitchesDuringRebase(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	featureTip := makeFeatureBranch(t, local)
+	writeAndCommit(t, local, "mine.txt", "mine\n", "main work")
+	tip := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main"))
+	pushFromTeammate(t, remote, "remote.txt", "remote\n")
+	remoteTip := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main"))
+	hook := filepath.Join(local, ".git", "hooks", "post-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nif test ! -e .git/fired; then touch .git/fired; git checkout -q feature; fi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoConfig{Name: "notes", Path: local, Remote: "origin"}
+	report, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repo, false)
+	if err == nil || report.Pushed || !strings.Contains(err.Error(), "restored") {
+		t.Fatalf("report = %+v, err = %v; want a restore error and no push", report, err)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main")); got != tip {
+		t.Fatalf("main = %s, want it restored to %s", got, tip)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != remoteTip {
+		t.Fatalf("remote main moved to %s", got)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "branch", "--show-current")); got != "main" {
+		t.Fatalf("checkout ended on %q", got)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); got != "" {
+		t.Fatalf("worktree is dirty after restore: %q", got)
+	}
+	assertFeatureUntouched(t, remote, local, featureTip)
+	assertNoLockLeft(t, local)
+
+	// With the hook gone the next cycle syncs normally.
+	if err := os.Remove(hook); err != nil {
+		t.Fatal(err)
+	}
+	report, err = gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repo, false)
+	if err != nil || !report.Pushed {
+		t.Fatalf("retry: report = %+v, err = %v", report, err)
+	}
+	assertMainSynced(t, remote, local, []string{"README.md", "mine.txt", "remote.txt"})
+	assertFeatureUntouched(t, remote, local, featureTip)
+}
+
+// A post-commit hook switches to an existing feature branch right after the
+// commit landed on main. Real daemon. The rollback for "commit landed on a
+// new branch" must not fire: the pre-existing feature commit stays, main
+// keeps the new commit, and nothing is pushed while the checkout is feature.
+func TestGitSyncDaemonKeepsExistingFeatureWhenHookSwitchesAfterCommit(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	featureTip := makeFeatureBranch(t, local)
+	base := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main"))
+	write(t, local, "mine.txt", "mine\n")
+	hook := "#!/bin/sh\nif test ! -e .git/fired; then touch .git/fired; git checkout -q feature; fi\n"
+	if err := os.WriteFile(filepath.Join(local, ".git", "hooks", "post-commit"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, logs, _, done, cancel := startDaemon(t, []repoConfig{{Name: "notes", Path: local, Remote: "origin"}})
+	waitForOrStop(t, "sync outcome", func() bool {
+		return strings.Contains(logs.String(), "skipped:") || strings.Contains(logs.String(), "sync failed") || strings.Contains(logs.String(), "pushed")
+	}, done)
+	stopDaemon(t, done, cancel)
+	assertFeatureUntouched(t, remote, local, featureTip)
+	if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main^")); got != base {
+		t.Fatalf("main's parent = %s; the commit must have landed on main", got)
+	}
+	if got := gitOutput(t, local, "show", "main:mine.txt"); got != "mine\n" {
+		t.Fatalf("main:mine.txt = %q", got)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "branch", "--show-current")); got != "feature" {
+		t.Fatalf("checkout is on %q; the hook's switch must be respected", got)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); got != "" {
+		t.Fatalf("index does not match the feature checkout: %q", got)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != base {
+		t.Fatalf("remote main moved to %s while the checkout is feature", got)
+	}
+	assertNoLockLeft(t, local)
+}
+
+// The hook-switch-during-rebase scenario where the feature commit and the
+// main commit share author, date, and message but differ in content. Commit
+// metadata must not be what proves the rebase result is ours.
+func TestGitSyncRestoresMainWhenHookSwitchesDuringRebaseWithSameMetadata(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	gitRun(t, local, "checkout", "-q", "-b", "feature")
+	writeAndCommit(t, local, "feature-only.txt", "unfinished feature\n", "work")
+	gitRun(t, local, "commit", "-q", "--amend", "--no-edit", "--date=2000-01-01T00:00:00+00:00")
+	featureTip := strings.TrimSpace(gitOutput(t, local, "rev-parse", "feature"))
+	gitRun(t, local, "checkout", "-q", "main")
+	writeAndCommit(t, local, "mine.txt", "mine\n", "work")
+	gitRun(t, local, "commit", "-q", "--amend", "--no-edit", "--date=2000-01-01T00:00:00+00:00")
+	tip := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main"))
+	pushFromTeammate(t, remote, "remote.txt", "remote\n")
+	remoteTip := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main"))
+	hook := "#!/bin/sh\nif test ! -e .git/fired; then touch .git/fired; git checkout -q feature; fi\n"
+	if err := os.WriteFile(filepath.Join(local, ".git", "hooks", "post-commit"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	report, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, false)
+	if err == nil || report.Pushed || !strings.Contains(err.Error(), "restored") {
+		t.Fatalf("report = %+v, err = %v; want a restore error and no push", report, err)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", "main")); got != tip {
+		t.Fatalf("main = %s, want it restored to %s", got, tip)
+	}
+	if got := gitOutput(t, local, "show", "main:mine.txt"); got != "mine\n" {
+		t.Fatalf("main work lost: %q", got)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != remoteTip {
+		t.Fatalf("remote main moved to %s", got)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); got != "" {
+		t.Fatalf("worktree is dirty after restore: %q", got)
+	}
+	assertFeatureUntouched(t, remote, local, featureTip)
+	assertNoLockLeft(t, local)
+}
+
+// A post-rewrite hook switches to an existing feature branch once main's
+// rebase has finished. Real daemon. Main keeps its rebased history, the
+// feature branch keeps its own commit, and nothing is pushed off-branch.
+func TestGitSyncDaemonKeepsExistingFeatureWhenHookSwitchesAfterRebase(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	featureTip := makeFeatureBranch(t, local)
+	writeAndCommit(t, local, "mine.txt", "mine\n", "main work")
+	pushFromTeammate(t, remote, "remote.txt", "remote\n")
+	remoteTip := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main"))
+	if err := os.WriteFile(filepath.Join(local, ".git", "hooks", "post-rewrite"), []byte("#!/bin/sh\ngit checkout -q feature\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, logs, _, done, cancel := startDaemon(t, []repoConfig{{Name: "notes", Path: local, Remote: "origin"}})
+	waitForOrStop(t, "sync outcome", func() bool {
+		return strings.Contains(logs.String(), "skipped:") || strings.Contains(logs.String(), "sync failed") || strings.Contains(logs.String(), "pushed")
+	}, done)
+	stopDaemon(t, done, cancel)
+	assertFeatureUntouched(t, remote, local, featureTip)
+	if got := gitOutput(t, local, "show", "main:mine.txt"); got != "mine\n" {
+		t.Fatalf("main work lost: %q", got)
+	}
+	if _, err := runGit(context.Background(), execCommandRunner{}, local, "merge-base", "--is-ancestor", remoteTip, "main"); err != nil {
+		t.Fatalf("main was not rebased onto the remote: %v", err)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "branch", "--show-current")); got != "feature" {
+		t.Fatalf("checkout is on %q; the hook's switch must be respected", got)
+	}
+	if got := gitOutput(t, local, "status", "--porcelain"); got != "" {
+		t.Fatalf("index does not match the feature checkout: %q", got)
+	}
+	if got := strings.TrimSpace(gitOutput(t, local, "--git-dir", remote, "rev-parse", "main")); got != remoteTip {
+		t.Fatalf("remote main moved to %s while the checkout is feature", got)
+	}
+	assertNoLockLeft(t, local)
 }
