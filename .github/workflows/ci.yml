@@ -35,7 +35,7 @@ jobs:
           go-version-file: go.mod
       - uses: goreleaser/goreleaser-action@v6
         with:
-          args: release --clean
+          args: release --clean --config .github/.goreleaser.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
