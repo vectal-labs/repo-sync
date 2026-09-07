@@ -1,38 +1,38 @@
 # repo-sync
 
-your git repos, always in sync.
+Your Git repos, always in sync.
 
-you edit. after 60 seconds of quiet, repo-sync commits, pulls, and pushes. it starts at login and runs in the background.
+You edit. After 60 seconds of quiet, repo-sync commits, pulls, and pushes. It starts at login and runs in the background.
 
-for notes, docs, config, and small team repos. macos only.
+For notes, docs, config, and small team repos. macOS only.
 
-![three teammates editing notes, docs, and team context, kept up to date by repo-sync and github](docs/team-sync.png)
+![Three teammates editing notes, docs, and team context, kept up to date by repo-sync and GitHub](docs/team-sync.png)
 
-## install
+## Install
 
 ```sh
 brew install --cask vectal-labs/tap/repo-sync && repo-sync setup
 ```
 
-requires [homebrew](https://brew.sh). git and github cli are installed for you.
+Requires [Homebrew](https://brew.sh). Git and GitHub CLI are installed for you.
 
-`setup` finds your repos, checks git access, and starts the background service. you choose which repos to sync or enter a path. nothing is preselected. it explains automatic commits and verifies the service before finishing.
+`setup` finds your repos, checks Git access, and starts the background service. You choose which repos to sync or enter a path. Nothing is preselected. It explains automatic commits and verifies the service before finishing.
 
 <details>
-<summary>install with go</summary>
+<summary>Install with Go</summary>
 
-requires go, git, and the xcode command line tools. github cli (`gh`) is needed only if setup must configure github https login.
+Requires Go, Git, and the Xcode Command Line Tools. GitHub CLI (`gh`) is only needed if setup must configure GitHub authentication over HTTPS.
 
 ```sh
 go install github.com/vectal-labs/repo-sync@latest
 "$(go env GOPATH)/bin/repo-sync" setup
 ```
 
-if you set `GOBIN`, use that directory instead. add the binary directory to your `PATH` to use `repo-sync` directly.
+If you set `GOBIN`, use that directory instead. Add the binary directory to your `PATH` to use `repo-sync` directly.
 
 </details>
 
-## usage
+## Usage
 
 ```sh
 repo-sync add                # sync the repo you're in
@@ -40,25 +40,25 @@ repo-sync add ~/code/notes    # sync a repo by path
 repo-sync status             # check the service and repositories
 ```
 
-## safety
+## Safety
 
-- secret filenames like `.env`, `*.pem`, and `.npmrc` are blocked by default. no content scanning.
-- no force-pushes or automatic conflict resolution. on conflict, it aborts the rebase and retries later.
-- only the remote's default branch syncs. feature branches stay untouched.
+- Secret filenames like `.env`, `*.pem`, and `.npmrc` are blocked by default. No content scanning.
+- No force-pushes or automatic conflict resolution. On conflict, it aborts the rebase and retries later.
+- Only the remote's default branch syncs. Feature branches stay untouched.
 
-[behavior and configuration](docs/behavior.md) · [secret overrides](docs/behavior.md#secrets)
+[Behavior and configuration](docs/behavior.md) · [Secret overrides](docs/behavior.md#secrets)
 
 <details>
-<summary>uninstall</summary>
+<summary>Uninstall</summary>
 
 ```sh
 repo-sync uninstall
 ```
 
-asks before removing the service, settings, logs, cache, and installed binary. repositories and shared git credentials are preserved. use `--yes` to skip confirmation, or `--keep-binary` to keep the program.
+Asks before removing the service, settings, logs, cache, and installed binary. Repositories and shared Git credentials are preserved. Use `--yes` to skip confirmation, or `--keep-binary` to keep the program.
 
-for homebrew, `brew uninstall --cask --zap repo-sync` also removes the standard settings, logs, and cache. plain `brew uninstall` stops the service and keeps those files.
+For Homebrew, `brew uninstall --cask --zap repo-sync` also removes the standard settings, logs, and cache. Plain `brew uninstall` stops the service and keeps those files.
 
 </details>
 
-[mit license](LICENSE)
+[MIT license](LICENSE)
