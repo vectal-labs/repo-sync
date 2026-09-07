@@ -91,22 +91,33 @@ func TestVerifyRepositoriesChecksDefaultBranchWithoutChangingRepository(t *testi
 }
 
 func TestVerifyRepositoriesWarnsWhenRemoteNeedsRebase(t *testing.T) {
-	remote, local := makeGitFixture(t)
-	other := filepath.Join(t.TempDir(), "other")
-	gitRun(t, "", "clone", remote, other)
-	configureGitUser(t, other)
-	writeAndCommit(t, other, "other.txt", "remote changed\n", "remote ahead")
-	gitRun(t, other, "push", "origin", "main")
-	before := gitOutput(t, local, "show-ref")
-	var out strings.Builder
-	if err := verifyRepositories(context.Background(), execCommandRunner{}, []repoConfig{{Name: "notes", Path: local, Remote: "origin"}}, strings.NewReader(""), &out); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), "needs a fetch/rebase") {
-		t.Fatalf("missing warning about behind branch: %s", out.String())
-	}
-	if gitOutput(t, local, "show-ref") != before {
-		t.Fatal("preflight updated refs while probing the remote")
+	for _, followHead := range []string{"", "always"} {
+		name := "default"
+		if followHead != "" {
+			name = followHead
+		}
+		t.Run(name, func(t *testing.T) {
+			remote, local := makeGitFixture(t)
+			if followHead != "" {
+				gitRun(t, local, "config", "remote.origin.followRemoteHEAD", followHead)
+			}
+			other := filepath.Join(t.TempDir(), "other")
+			gitRun(t, "", "clone", remote, other)
+			configureGitUser(t, other)
+			writeAndCommit(t, other, "other.txt", "remote changed\n", "remote ahead")
+			gitRun(t, other, "push", "origin", "main")
+			before := gitOutput(t, local, "show-ref")
+			var out strings.Builder
+			if err := verifyRepositories(context.Background(), execCommandRunner{}, []repoConfig{{Name: "notes", Path: local, Remote: "origin"}}, strings.NewReader(""), &out); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), "needs a fetch/rebase") {
+				t.Fatalf("missing warning about behind branch: %s", out.String())
+			}
+			if gitOutput(t, local, "show-ref") != before {
+				t.Fatal("preflight updated refs while probing the remote")
+			}
+		})
 	}
 }
 
@@ -142,7 +153,7 @@ func TestVerifyRepositoriesRequiresGitHubCLIOnlyForMissingGitHubCredentials(t *t
 				if name == "git" && args[0] == "remote" {
 					return test.remote, nil
 				}
-				if name == "git" && args[0] == "fetch" && test.fetchError != nil {
+				if name == "git" && slices.Contains(args, "fetch") && test.fetchError != nil {
 					return "", test.fetchError
 				}
 				return (execCommandRunner{}).run(ctx, dir, stdin, name, args...)
