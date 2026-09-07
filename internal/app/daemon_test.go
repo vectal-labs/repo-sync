@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -54,9 +55,25 @@ func newTestDaemon(t *testing.T, names ...string) *testDaemon {
 		cfg.Repositories = append(cfg.Repositories, repoConfig{Name: name, Path: filepath.Join(t.TempDir(), name), Remote: "origin"})
 	}
 	fake := &fakeSyncer{results: make(map[string]func() (syncReport, error)), calls: make(map[string]int)}
-	td := &testDaemon{syncer: fake, clock: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)}
+	td := newTestDaemonWithSyncer(t, cfg, fake)
+	td.syncer = fake
+	return td
+}
+
+// newGitTestDaemon drives the daemon against a real Git checkout with a fake
+// clock, so backoff and notification timing can be checked without waiting.
+func newGitTestDaemon(t *testing.T, name, path string) *testDaemon {
+	t.Helper()
+	cfg := newDefaultConfig()
+	cfg.Repositories = []repoConfig{{Name: name, Path: path, Remote: "origin"}}
+	return newTestDaemonWithSyncer(t, cfg, gitSyncer{runner: execCommandRunner{}})
+}
+
+func newTestDaemonWithSyncer(t *testing.T, cfg config, syncer syncer) *testDaemon {
+	t.Helper()
+	td := &testDaemon{clock: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)}
 	td.daemon = newDaemon(context.Background(), cfg, execCommandRunner{}, log.New(io.Discard, "", 0))
-	td.daemon.syncer = fake
+	td.daemon.syncer = syncer
 	td.daemon.now = func() time.Time {
 		td.mu.Lock()
 		defer td.mu.Unlock()
@@ -269,6 +286,64 @@ func TestSecretFilesNotifyOncePerIncident(t *testing.T) {
 	td.syncRepo(state, true)
 	if got := td.notifications(); len(got) != 2 {
 		t.Fatalf("a new incident for the same file must notify again: %q", got)
+	}
+}
+
+// TestPersistentRemoteLockBacksOffNotifiesOnceAndRecovers runs the daemon's
+// cycle against a real remote whose default branch is stuck behind a leftover
+// lock file. That is not a teammate racing us, so it must follow the normal
+// failure path: backoff, one delayed popup, and a clean recovery.
+func TestPersistentRemoteLockBacksOffNotifiesOnceAndRecovers(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	write(t, local, "public.txt", "public\n")
+	lock := filepath.Join(remote, "refs", "heads", "main.lock")
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	td := newGitTestDaemon(t, "notes", local)
+	state := td.states["notes"]
+
+	td.syncRepo(state, true)
+	state.mu.Lock()
+	failures, incident, next := state.failures, state.incident, state.nextAttempt
+	state.mu.Unlock()
+	if failures != 1 || !strings.Contains(incident, "cannot lock ref") || next.Sub(td.now()) != minBackoff {
+		t.Fatalf("failures = %d, incident = %q, next attempt in %s; want one normal failure with backoff", failures, incident, next.Sub(td.now()))
+	}
+	if got := td.notifications(); len(got) != 0 {
+		t.Fatalf("a fresh failure must stay silent: %q", got)
+	}
+
+	td.advance(2 * time.Minute)
+	td.syncRepo(state, true)
+	td.advance(failureNotifyAfter)
+	td.syncRepo(state, true)
+	td.advance(time.Hour)
+	td.syncRepo(state, true)
+	got := td.notifications()
+	if len(got) != 1 || !strings.Contains(got[0], "notes") || !strings.Contains(got[0], "cannot lock ref") {
+		t.Fatalf("notifications = %q, want exactly one naming the repo and the cause", got)
+	}
+	if tree := gitOutput(t, local, "--git-dir", remote, "ls-tree", "-r", "--name-only", "main"); strings.Contains(tree, "public.txt") {
+		t.Fatalf("remote moved while locked:\n%s", tree)
+	}
+
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+	td.advance(time.Hour)
+	td.syncRepo(state, true)
+	state.mu.Lock()
+	failures, incident, noted := state.failures, state.incident, state.incidentNoted
+	state.mu.Unlock()
+	if failures != 0 || incident != "" || noted {
+		t.Fatalf("recovery did not reset state: failures = %d, incident = %q, noted = %v", failures, incident, noted)
+	}
+	if got := gitOutput(t, local, "--git-dir", remote, "show", "main:public.txt"); got != "public\n" {
+		t.Fatalf("kept commit was not pushed after unlock: %q", got)
+	}
+	if got := td.notifications(); len(got) != 1 {
+		t.Fatalf("recovery must not add a popup: %q", got)
 	}
 }
 

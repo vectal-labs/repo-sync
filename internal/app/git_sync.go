@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -136,16 +137,24 @@ func (s gitSyncer) sync(ctx context.Context, repo repoConfig, commitLocal bool) 
 	}
 }
 
-// pushRejected reports a non-fast-forward rejection: the remote branch moved
-// after we fetched it.
+// Push rejections Git reports when the remote branch moved after our fetch.
+// The reason sits in parentheses at the end of a "[rejected]" line, or the
+// remote's compare-and-swap names the two object ids it saw. Anything else
+// that mentions these words (a path, a branch name, a hook message) is not
+// evidence of a concurrent push.
+var (
+	pushRaceReason = regexp.MustCompile(`(?m)^ ! \[rejected\] .*\((fetch first|non-fast-forward)\)\s*$`)
+	pushRaceSwap   = regexp.MustCompile(`cannot lock ref '[^'\n]*': is at [0-9a-f]{7,64} but expected [0-9a-f]{7,64}`)
+)
+
+// pushRejected reports that a concurrent push won the race, so fetching and
+// rebasing once more will most likely succeed. Every other push failure, such
+// as a stuck lock file, a permission problem, or a hook refusal, does not go
+// away by retrying immediately and stays a normal error: it backs off and
+// notifies once it has lasted long enough.
 func pushRejected(err error) bool {
 	message := err.Error()
-	for _, marker := range []string{"cannot lock ref", "fetch first", "non-fast-forward", "[rejected]", "stale info"} {
-		if strings.Contains(message, marker) {
-			return true
-		}
-	}
-	return false
+	return pushRaceReason.MatchString(message) || pushRaceSwap.MatchString(message)
 }
 
 // preflight checks that the repository is safe to touch and returns the

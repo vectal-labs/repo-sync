@@ -48,6 +48,7 @@
 ## conflicts and failures
 
 - on a rebase conflict it runs `git rebase --abort`, keeps your local commits, and retries later. it never force-pushes and never resolves conflicts.
+- if a teammate pushes between the fetch and the push, it fetches, rebases, and pushes once more right away. only Git's own race reasons count: `fetch first`, `non-fast-forward`, or the remote reporting the ref is at one commit but expected another. a stuck remote lock file, a permission error, or a hook refusal is a normal failure: it backs off and notifies like any other error.
 - failures retry with backoff: 1 minute, doubling, up to 30 minutes. success resets it.
 - one failing repo never blocks another.
 - each repo runs one sync cycle at a time. a cycle owns its repo until the Git work, the result bookkeeping, the notifications, and the retry decision are all applied. only then can the next cycle for that repo start. different repos sync in parallel.
