@@ -340,7 +340,7 @@ func (r *authRepairRunner) run(_ context.Context, _, _, name string, args ...str
 	if name == "git" && len(args) >= 3 && args[0] == "remote" && args[1] == "get-url" {
 		return "https://github.com/acme/notes.git\n", nil
 	}
-	if name == "git" && len(args) >= 1 && args[0] == "fetch" {
+	if name == "git" && slices.Contains(args, "fetch") {
 		r.fetches++
 		if r.fetches == 1 {
 			return "", errors.New("fatal: could not read Username for 'https://github.com': terminal prompts disabled")

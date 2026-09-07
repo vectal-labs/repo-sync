@@ -110,6 +110,50 @@ func TestVerifyRepositoriesWarnsWhenRemoteNeedsRebase(t *testing.T) {
 	}
 }
 
+func TestVerifyRepositoriesPreservesRemoteHEADAndConfig(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		remote       string
+		existingHEAD bool
+	}{
+		{name: "origin missing HEAD", remote: "origin"},
+		{name: "origin existing HEAD", remote: "origin", existingHEAD: true},
+		{name: "upstream missing HEAD", remote: "upstream"},
+		{name: "upstream existing HEAD", remote: "upstream", existingHEAD: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			remote, local := makeGitFixture(t)
+			if test.remote != "origin" {
+				gitRun(t, local, "remote", "rename", "origin", test.remote)
+			}
+			gitRun(t, local, "branch", "trunk")
+			gitRun(t, local, "push", test.remote, "trunk")
+			gitRun(t, "", "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+			headRef := "refs/remotes/" + test.remote + "/HEAD"
+			if test.existingHEAD {
+				gitRun(t, local, "remote", "set-head", test.remote, "main")
+			} else {
+				gitRun(t, local, "update-ref", "--no-deref", "-d", headRef)
+			}
+			gitRun(t, local, "config", "remote."+test.remote+".followRemoteHEAD", "always")
+			beforeRefs := gitOutput(t, local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+			configPath := filepath.Join(local, ".git", "config")
+			beforeConfig := readPreflightFile(t, configPath)
+
+			if err := verifyRepositories(context.Background(), execCommandRunner{}, []repoConfig{{Name: "notes", Path: local, Remote: test.remote}}, strings.NewReader(""), &strings.Builder{}); err != nil {
+				t.Fatal(err)
+			}
+			if afterRefs := gitOutput(t, local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); afterRefs != beforeRefs {
+				t.Fatalf("preflight changed refs:\nbefore:\n%safter:\n%s", beforeRefs, afterRefs)
+			}
+			if !bytes.Equal(beforeConfig, readPreflightFile(t, configPath)) {
+				t.Fatal("preflight changed saved Git configuration")
+			}
+		})
+	}
+}
+
 func TestVerifyRepositoriesRejectsInvalidEffectiveIdentity(t *testing.T) {
 	_, local := makeGitFixture(t)
 	gitRun(t, local, "config", "user.name", "<>")
@@ -142,7 +186,7 @@ func TestVerifyRepositoriesRequiresGitHubCLIOnlyForMissingGitHubCredentials(t *t
 				if name == "git" && args[0] == "remote" {
 					return test.remote, nil
 				}
-				if name == "git" && args[0] == "fetch" && test.fetchError != nil {
+				if name == "git" && slices.Contains(args, "fetch") && test.fetchError != nil {
 					return "", test.fetchError
 				}
 				return (execCommandRunner{}).run(ctx, dir, stdin, name, args...)
