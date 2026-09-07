@@ -13,6 +13,7 @@ import (
 )
 
 func TestGitSyncCommitsRebasesAndPushes(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	if err := os.WriteFile(filepath.Join(local, "new file.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -40,6 +41,7 @@ func TestGitSyncCommitsRebasesAndPushes(t *testing.T) {
 }
 
 func TestGitSyncPullsRemoteChanges(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	other := filepath.Join(t.TempDir(), "other")
 	gitRun(t, "", "clone", remote, other)
@@ -57,6 +59,7 @@ func TestGitSyncPullsRemoteChanges(t *testing.T) {
 }
 
 func TestGitSyncSkipsFeatureBranchWithoutTouchingIt(t *testing.T) {
+	t.Parallel()
 	_, local := makeGitFixture(t)
 	gitRun(t, local, "checkout", "-b", "feature")
 	if err := os.WriteFile(filepath.Join(local, "feature.txt"), []byte("nope"), 0o644); err != nil {
@@ -76,6 +79,7 @@ func TestGitSyncSkipsFeatureBranchWithoutTouchingIt(t *testing.T) {
 }
 
 func TestGitSyncSkipsDetachedHead(t *testing.T) {
+	t.Parallel()
 	_, local := makeGitFixture(t)
 	gitRun(t, local, "checkout", "--detach")
 	_, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
@@ -86,6 +90,7 @@ func TestGitSyncSkipsDetachedHead(t *testing.T) {
 }
 
 func TestGitSyncAbortsRebaseConflictAndSkips(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	other := filepath.Join(t.TempDir(), "other")
 	gitRun(t, "", "clone", remote, other)
@@ -115,6 +120,7 @@ func TestGitSyncAbortsRebaseConflictAndSkips(t *testing.T) {
 }
 
 func TestGitSyncSkipsHumanOperationWithoutTouchingIt(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		marker string
@@ -128,6 +134,7 @@ func TestGitSyncSkipsHumanOperationWithoutTouchingIt(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			_, local := makeGitFixture(t)
 			gitDir := strings.TrimSpace(gitOutput(t, local, "rev-parse", "--git-dir"))
 			marker := filepath.Join(local, gitDir, test.marker)
@@ -153,6 +160,7 @@ func TestGitSyncSkipsHumanOperationWithoutTouchingIt(t *testing.T) {
 }
 
 func TestGitSyncUsesRemoteDefaultBranch(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
 	seed := filepath.Join(root, "seed")
@@ -188,6 +196,7 @@ func TestGitSyncUsesRemoteDefaultBranch(t *testing.T) {
 }
 
 func TestGitSyncLeavesSecretFilesOut(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	files := map[string]string{
 		".env":            "TOKEN=1\n",
@@ -234,6 +243,7 @@ func TestGitSyncLeavesSecretFilesOut(t *testing.T) {
 }
 
 func TestGitSyncSkipsWhenTrackedSecretIsModified(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, ".env", "TOKEN=old\n", "user committed a secret earlier")
 	gitRun(t, local, "push", "origin", "main")
@@ -251,6 +261,7 @@ func TestGitSyncSkipsWhenTrackedSecretIsModified(t *testing.T) {
 }
 
 func TestParseStatus(t *testing.T) {
+	t.Parallel()
 	output := " M a.txt\x00?? b/c.txt\x00R  new.txt\x00old.txt\x00A  d.txt\x00 R wt.txt\x00wt-old.txt\x00C  copy.txt\x00src.txt\x00"
 	got := parseStatus(output)
 	want := []change{
@@ -330,6 +341,7 @@ func (h *hookedRunner) run(ctx context.Context, dir, stdin, name string, args ..
 }
 
 func TestGitSyncSkipsWhenFileVanishesBeforeAdd(t *testing.T) {
+	t.Parallel()
 	_, local := makeGitFixture(t)
 	gone := filepath.Join(local, "gone.txt")
 	if err := os.WriteFile(gone, []byte("brief\n"), 0o644); err != nil {
@@ -348,6 +360,7 @@ func TestGitSyncSkipsWhenFileVanishesBeforeAdd(t *testing.T) {
 }
 
 func TestGitSyncSkipsWhenWorktreeChangesBeforeRebase(t *testing.T) {
+	t.Parallel()
 	_, local := makeGitFixture(t)
 	runner := &hookedRunner{inner: execCommandRunner{}, command: "rebase", before: func() {
 		if err := os.WriteFile(filepath.Join(local, "README.md"), []byte("edited mid-cycle\n"), 0o644); err != nil {
@@ -365,6 +378,7 @@ func TestGitSyncSkipsWhenWorktreeChangesBeforeRebase(t *testing.T) {
 }
 
 func TestGitSyncRetriesWhenRemoteMovesDuringPush(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	other := filepath.Join(t.TempDir(), "other")
 	gitRun(t, "", "clone", "-q", remote, other)
@@ -390,6 +404,7 @@ func TestGitSyncRetriesWhenRemoteMovesDuringPush(t *testing.T) {
 }
 
 func TestGitSyncReportsPersistentRemoteLockAsFailure(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	write(t, local, "public.txt", "public\n")
 	lock := filepath.Join(remote, "refs", "heads", "main.lock")
@@ -432,6 +447,7 @@ func TestGitSyncReportsPersistentRemoteLockAsFailure(t *testing.T) {
 }
 
 func TestPushRejected(t *testing.T) {
+	t.Parallel()
 	rejected := []string{
 		"git push origin HEAD:main: exit status 1: To github.com:x/y.git\n ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs to 'github.com:x/y.git'",
 		"git push origin HEAD:main: exit status 1: To github.com:x/y.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to 'github.com:x/y.git'",
@@ -493,6 +509,7 @@ func assertWithheld(t *testing.T, err error, report syncReport, paths ...string)
 }
 
 func TestGitSyncHoldsPushWhenSecretIsStagedRightBeforeCommit(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	write(t, local, "public.txt", "public\n")
 	runner := &hookedRunner{inner: execCommandRunner{}, command: "commit", before: func() {
@@ -515,6 +532,7 @@ func TestGitSyncHoldsPushWhenSecretIsStagedRightBeforeCommit(t *testing.T) {
 }
 
 func TestGitSyncHoldsPushWhenPreCommitHookStagesSecret(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	write(t, local, "public.txt", "public\n")
 	hook := filepath.Join(local, ".git", "hooks", "pre-commit")
@@ -530,6 +548,7 @@ func TestGitSyncHoldsPushWhenPreCommitHookStagesSecret(t *testing.T) {
 }
 
 func TestGitSyncHoldsManualSecretCommitUntilDroppedOrAllowed(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, ".env", "TOKEN=1\n", "user committed a secret by hand")
 	writeAndCommit(t, local, "public.txt", "public\n", "safe follow-up")
@@ -571,6 +590,7 @@ func TestGitSyncHoldsManualSecretCommitUntilDroppedOrAllowed(t *testing.T) {
 }
 
 func TestGitSyncHoldsSecretCommittedThenDeletedBeforePush(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	if err := os.Mkdir(filepath.Join(local, "keys"), 0o755); err != nil {
 		t.Fatal(err)
@@ -592,6 +612,7 @@ func TestGitSyncHoldsSecretCommittedThenDeletedBeforePush(t *testing.T) {
 }
 
 func TestGitSyncStillPushesAroundSecretsTheRemoteAlreadyHas(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, ".env", "TOKEN=old\n", "secret already published")
 	gitRun(t, local, "push", "-q", "origin", "main")
@@ -625,6 +646,7 @@ func TestGitSyncStillPushesAroundSecretsTheRemoteAlreadyHas(t *testing.T) {
 }
 
 func TestGitSyncPushesOnlyTheValidatedCommit(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	write(t, local, "public.txt", "public\n")
 	// A manual secret commit lands on the branch after the check, before push.
@@ -645,6 +667,7 @@ func TestGitSyncPushesOnlyTheValidatedCommit(t *testing.T) {
 }
 
 func TestGitSyncRevalidatesAfterRejectedPush(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	other := filepath.Join(t.TempDir(), "other")
 	gitRun(t, "", "clone", "-q", remote, other)
@@ -667,6 +690,7 @@ func TestGitSyncRevalidatesAfterRejectedPush(t *testing.T) {
 }
 
 func TestGitSyncOrdinaryPushIsUnaffected(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, "notes.md", "n\n", "manual safe commit")
 	writeAndCommit(t, local, ".env.example", "TOKEN=\n", "template is fine")
@@ -687,6 +711,7 @@ func TestGitSyncOrdinaryPushIsUnaffected(t *testing.T) {
 // submodules must neither break safe pushes nor publish unchecked.
 
 func TestGitSyncHoldsSecretHiddenByReplaceRef(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	base := strings.TrimSpace(gitOutput(t, local, "rev-parse", "HEAD"))
 	writeAndCommit(t, local, ".env", "TOKEN=1\n", "secret")
@@ -705,6 +730,7 @@ func TestGitSyncHoldsSecretHiddenByReplaceRef(t *testing.T) {
 }
 
 func TestGitSyncRevalidatesWhenDestinationIsRolledBack(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	base := strings.TrimSpace(gitOutput(t, local, "rev-parse", "HEAD"))
 	writeAndCommit(t, local, ".env", "TOKEN=1\n", "previously published")
@@ -723,6 +749,7 @@ func TestGitSyncRevalidatesWhenDestinationIsRolledBack(t *testing.T) {
 }
 
 func TestGitSyncValidatesAgainstSeparatePushDestination(t *testing.T) {
+	t.Parallel()
 	source, local := makeGitFixture(t)
 	destination := filepath.Join(t.TempDir(), "destination.git")
 	gitRun(t, local, "clone", "-q", "--bare", source, destination)
@@ -750,6 +777,7 @@ func TestGitSyncValidatesAgainstSeparatePushDestination(t *testing.T) {
 }
 
 func TestGitSyncNeverOverwritesDestinationHistoryItDoesNotHave(t *testing.T) {
+	t.Parallel()
 	source, local := makeGitFixture(t)
 	destination := filepath.Join(t.TempDir(), "destination.git")
 	gitRun(t, local, "clone", "-q", "--bare", source, destination)
@@ -774,6 +802,7 @@ func TestGitSyncNeverOverwritesDestinationHistoryItDoesNotHave(t *testing.T) {
 }
 
 func TestGitSyncRetriesLeaseRaceThenPublishes(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	other := filepath.Join(t.TempDir(), "other")
 	gitRun(t, "", "clone", "-q", remote, other)
@@ -811,6 +840,7 @@ func submoduleFixture(t *testing.T) (parentRemote, parent, childRemote, child st
 }
 
 func TestGitSyncWaitsForSubmoduleCommitsInsteadOfPushingThem(t *testing.T) {
+	t.Parallel()
 	parentRemote, parent, childRemote, child := submoduleFixture(t)
 	writeAndCommit(t, child, "safe.txt", "safe\n", "child work")
 	gitRun(t, parent, "add", "child")
@@ -847,6 +877,7 @@ func TestGitSyncWaitsForSubmoduleCommitsInsteadOfPushingThem(t *testing.T) {
 }
 
 func TestGitSyncNeverPublishesSubmoduleSecretThroughParent(t *testing.T) {
+	t.Parallel()
 	parentRemote, parent, childRemote, child := submoduleFixture(t)
 	writeAndCommit(t, child, ".env", "TOKEN=1\n", "child secret")
 	gitRun(t, parent, "add", "child")
@@ -870,6 +901,7 @@ func TestGitSyncNeverPublishesSubmoduleSecretThroughParent(t *testing.T) {
 }
 
 func TestGitSyncRecoveryForModifiedTrackedSecret(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, ".env", "TOKEN=old\n", "published earlier")
 	gitRun(t, local, "push", "-q", "origin", "main")
@@ -902,6 +934,7 @@ func TestGitSyncRecoveryForModifiedTrackedSecret(t *testing.T) {
 }
 
 func TestUnpublishedSubmodules(t *testing.T) {
+	t.Parallel()
 	err := errors.New("git push: exit status 128: The following submodule paths contain changes that can\nnot be found on any remote:\n  child\n  vendor/lib\n\nPlease try\n\n\tgit push --recurse-submodules=on-demand\n")
 	if got := unpublishedSubmodules(err); !reflect.DeepEqual(got, []string{"child", "vendor/lib"}) {
 		t.Fatalf("unpublishedSubmodules = %v", got)
@@ -912,6 +945,7 @@ func TestUnpublishedSubmodules(t *testing.T) {
 }
 
 func TestGitSyncAdviceForSecretAlreadyOnFetchSource(t *testing.T) {
+	t.Parallel()
 	source, local := makeGitFixture(t)
 	destination := filepath.Join(t.TempDir(), "destination.git")
 	gitRun(t, local, "clone", "-q", "--bare", source, destination)
@@ -950,6 +984,7 @@ func TestGitSyncAdviceForSecretAlreadyOnFetchSource(t *testing.T) {
 }
 
 func TestWithheldAdviceMixesLocalAndSourceCommits(t *testing.T) {
+	t.Parallel()
 	advice := withheldAdvice([]withheldSecret{
 		{Path: "a.pem", Commit: "1111111"},
 		{Path: ".env", Commit: "2222222", Tracked: true},
@@ -965,6 +1000,7 @@ func TestWithheldAdviceMixesLocalAndSourceCommits(t *testing.T) {
 // A staged rename (`git mv`) must sync as a rename: the old path has already
 // left the index, so there is nothing to `git add` for it.
 func TestGitSyncCommitsStagedRename(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	gitRun(t, local, "mv", "README.md", "renamed.md")
 
@@ -990,6 +1026,7 @@ func TestGitSyncCommitsStagedRename(t *testing.T) {
 // A staged deletion (`git rm`) must sync even when it is the only change, and
 // an untracked secret next to it must stay out of the commit.
 func TestGitSyncCommitsStagedDeletion(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	gitRun(t, local, "rm", "-q", "README.md")
 	write(t, local, ".env", "TOKEN=1\n")
@@ -1013,6 +1050,7 @@ func TestGitSyncCommitsStagedDeletion(t *testing.T) {
 // afterwards, a staged file edited again, an unstaged deletion, and a path
 // with NUL-unfriendly characters. All of it must land as the user has it.
 func TestGitSyncCommitsMixedStagedAndUnstagedChanges(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, "keep.txt", "keep\n", "add keep")
 	writeAndCommit(t, local, "drop.txt", "drop\n", "add drop")
@@ -1053,6 +1091,7 @@ func TestGitSyncCommitsMixedStagedAndUnstagedChanges(t *testing.T) {
 // Renaming a file onto a blocked name is treated like any other blocked file:
 // the secret is unstaged and stays local; the rest of the change still syncs.
 func TestGitSyncBlocksRenameToSecretPath(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, "notes.txt", "TOKEN=1\n", "add notes")
 	gitRun(t, local, "push", "-q", "origin", "main")
@@ -1079,6 +1118,7 @@ func TestGitSyncBlocksRenameToSecretPath(t *testing.T) {
 // not a deletion, and must sync as one so a teammate's edit to another part
 // of the same file still merges cleanly.
 func TestGitSyncKeepsRecreatedIntentToAddFile(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	base := "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n"
 	writeAndCommit(t, local, "shared.txt", base, "base")
@@ -1115,6 +1155,7 @@ func TestGitSyncKeepsRecreatedIntentToAddFile(t *testing.T) {
 // Deleting a blocked path is not a leak. Renaming a tracked `.env` to a safe
 // name, or removing it with `git rm`, must sync so the secret leaves the tree.
 func TestGitSyncCommitsDeletionOfTrackedSecret(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name string
 		git  []string
@@ -1124,6 +1165,7 @@ func TestGitSyncCommitsDeletionOfTrackedSecret(t *testing.T) {
 		{"git rm", []string{"rm", "-q", ".env"}, []string{"README.md"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			remote, local := makeGitFixture(t)
 			writeAndCommit(t, local, ".env", "fixture only\n", "user committed a secret earlier")
 			gitRun(t, local, "push", "-q", "origin", "main")
@@ -1160,6 +1202,7 @@ func TestGitSyncCommitsDeletionOfTrackedSecret(t *testing.T) {
 // secrets. When the remote has not moved there is nothing to check out and
 // the deletion syncs normally.
 func TestGitSyncRefusesRebaseOverRetainedIgnoredFile(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		file   string
@@ -1172,6 +1215,7 @@ func TestGitSyncRefusesRebaseOverRetainedIgnoredFile(t *testing.T) {
 		{"nested secret, unrelated remote edit", "config/.env", "teammate.txt"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			remote, local := makeGitFixture(t)
 			if err := os.MkdirAll(filepath.Dir(filepath.Join(local, test.file)), 0o755); err != nil {
 				t.Fatal(err)
@@ -1251,6 +1295,7 @@ func TestGitSyncRefusesRebaseOverRetainedIgnoredFile(t *testing.T) {
 // checkout refuses to overwrite it. repo-sync must then leave the file exactly
 // as it is, even when an editor wrote newer contents a moment earlier.
 func TestGitSyncKeepsNewerUntrackedEditWhenRebaseIsRefused(t *testing.T) {
+	t.Parallel()
 	remote, local := makeGitFixture(t)
 	writeAndCommit(t, local, ".env", "old\n", "tracked baseline")
 	gitRun(t, local, "push", "-q", "origin", "main")

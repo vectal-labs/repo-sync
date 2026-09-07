@@ -17,6 +17,7 @@ import (
 // TestEndToEndTwoClonesStayInSync runs the real daemon (FSEvents, git, timers)
 // against a bare remote and two clones, the way a user experiences it.
 func TestEndToEndTwoClonesStayInSync(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("end-to-end test")
 	}
@@ -207,6 +208,7 @@ func (f *failPushOnce) run(ctx context.Context, dir, stdin, name string, args ..
 // touch that repository until the older result is applied, while another
 // repository keeps syncing.
 func TestEndToEndCycleFinishesBeforeNextStarts(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("end-to-end test")
 	}
@@ -309,6 +311,7 @@ func TestEndToEndCycleFinishesBeforeNextStarts(t *testing.T) {
 // its folder appears, and a folder that vanishes mid-run must come back the
 // same way. No restart, no `add`, no manual command.
 func TestEndToEndMissingFolderNeverStopsTheService(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("end-to-end test")
 	}
@@ -370,6 +373,7 @@ func TestEndToEndMissingFolderNeverStopsTheService(t *testing.T) {
 // TestEndToEndAllFoldersMissingThenOneReturns starts the daemon with nothing
 // to watch at all. It must idle and pick up the first folder that shows up.
 func TestEndToEndAllFoldersMissingThenOneReturns(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("end-to-end test")
 	}
@@ -450,6 +454,7 @@ func stopDaemon(t *testing.T, done <-chan error, cancel context.CancelFunc) {
 // refuse the rebase, report a failure, keep running, and never touch or
 // publish the retained copy.
 func TestEndToEndUntrackedIgnoredFileSurvivesSync(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("end-to-end test")
 	}
@@ -463,6 +468,7 @@ func TestEndToEndUntrackedIgnoredFileSurvivesSync(t *testing.T) {
 		{"nested path", "config/.env", "teammate.txt"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			remote, local := makeGitFixture(t)
 			if err := os.MkdirAll(filepath.Dir(filepath.Join(local, test.file)), 0o755); err != nil {
 				t.Fatal(err)
