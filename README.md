@@ -12,7 +12,7 @@ For shared team repos containing documents, finance, legal, skills, and team con
 brew install --cask vectal-labs/tap/repo-sync && repo-sync setup
 ```
 
-![Three teammates editing notes, docs, and team context, kept up to date by repo-sync and GitHub](docs/team-sync.webp)
+https://github.com/user-attachments/assets/ef544205-2178-42d1-84e6-daf3ff460009
 
 Requires [Homebrew](https://brew.sh). Git and GitHub CLI are installed for you.
 
