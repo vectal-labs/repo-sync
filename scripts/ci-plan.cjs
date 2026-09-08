@@ -6,8 +6,9 @@ module.exports = async function shouldRunChecks({ github, context, core,
 }) {
   const docsOnly = (range) => git(['diff', '--no-renames', '--name-only', '-z', ...range, '--'])
     .split('\0').filter(Boolean)
-    .every((file) => file.endsWith('.md') || file === 'LICENSE' ||
-      /^docs\/.+\.(png|jpe?g|gif|svg|webp|ico|pdf)$/i.test(file));
+    .every((file) => !file.startsWith('.agents/skills/repo-sync/') &&
+      (file.endsWith('.md') || file === 'LICENSE' ||
+        /^docs\/.+\.(png|jpe?g|gif|svg|webp|ico|pdf)$/i.test(file)));
 
   try {
     const head = git(['rev-parse', 'HEAD']).trim();

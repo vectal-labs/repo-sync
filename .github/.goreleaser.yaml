@@ -33,7 +33,8 @@ homebrew_casks:
     dependencies:
       - formula: git
       - formula: gh
-    # Uninstall also runs during upgrades. User data belongs in zap.
+    # Uninstall also runs during upgrades. Settings belong in zap; the verified
+    # skill cleanup runs only during a true uninstall.
     zap:
       trash:
         - ~/Library/LaunchAgents/com.vectal-labs.repo-sync.plist
@@ -87,6 +88,9 @@ homebrew_casks:
               RepoSyncCaskLifecycle.stop(invoke, "gui/#{Process.uid}/com.vectal-labs.repo-sync.updates")
               File.unlink(updater_plist) if File.file?(updater_plist)
               result = super(upgrade: upgrade, reinstall: reinstall, command: command, **options)
+              # This helper only removes unchanged managed skill copies. It uses
+              # its own lock because this phase already holds the update lock.
+              invoke.call cask.staged_path.join("repo-sync").to_s, args: ["skill", "uninstall"], timeout: 30
               # Package removal follows preflight. Retain the lock on the artifact
               # until Homebrew exits so another updater cannot restart the daemon.
               @repo_sync_uninstall_lock = lock
@@ -133,3 +137,6 @@ homebrew_casks:
             # Existing updater registrations must survive an upgrade they started.
             system_command "#{staged_path}/repo-sync", args: ["install-updater", "--config", config], timeout: 30
           end
+          # Refresh only previously installed, unchanged skills. No receipt is
+          # a no-op, including fresh installations that have not run setup.
+          system_command "#{staged_path}/repo-sync", args: ["skill", "refresh"], timeout: 30

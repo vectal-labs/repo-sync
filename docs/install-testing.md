@@ -50,9 +50,24 @@ Use a disposable macOS account or VM for Homebrew and launchd checks. Changing `
 5. Repeat with stale `status-<64 lowercase hex digits>.json` cache files, numbered `stdout.log` / `stderr.log` rotations, and `.repo-sync-<digits>` temporary files in config, cache, or LaunchAgents folders. Confirm they are removed. Put `personal.log` in the app's log folder; it must appear under `Preserved`. Check the final `Removed`, `Preserved`, and `Failed` sections.
 6. Make a recorded custom config's parent folder unwritable. Confirm uninstall returns an error, reports the failed path, and retains `install.json` for retry. Restore permissions and rerun. Confirm the old config is removed even after its plist is gone.
 7. Repeat with a Go installation and `--config` pointing to custom settings. Test `--keep-binary` twice: binaries remain, and `install.json` retains only binary paths for later removal.
-8. Test `brew uninstall --cask repo-sync`: the service stops and user files remain. The updater job and its schedule must be removed immediately. With `--zap`, standard config, logs, cache, and the remaining plist move to the trash.
+8. Test `brew uninstall --cask repo-sync`: the service stops and settings remain. The updater job and its schedule must be removed immediately. Unchanged managed skills are removed; customized skill folders remain. With `--zap`, standard config, logs, cache, and the remaining plist move to the trash.
 
-The cask keeps cleanup under `zap` because Homebrew also runs uninstall hooks during upgrades. Its pre-uninstall hook preserves the main plist and waits up to 45 seconds for the old daemon to exit. A scoped artifact extension receives Homebrew’s actual upgrade/reinstall flags, preserving the updater during those operations and removing its schedule during a true uninstall. Direct Homebrew uninstall retains the update lock after preflight until its process exits, preventing a competing updater from restarting the daemon during package removal. A timeout aborts removal or restart. Post-install reloads only an existing plist, preserves its config path, switches to the stable Homebrew binary link, and enrolls existing setups into updates without replacing an already registered updater. See the [GoReleaser cask schema](https://goreleaser.com/customization/homebrew_casks/) and [Homebrew Cask Cookbook](https://docs.brew.sh/Cask-Cookbook#stanza-zap).
+The cask keeps settings cleanup under `zap` because Homebrew also runs uninstall hooks during upgrades. Its pre-uninstall hook preserves the main plist and waits up to 45 seconds for the old daemon to exit. A scoped artifact extension receives Homebrew’s actual upgrade/reinstall flags, preserving the updater and skills during those operations. True uninstall removes the updater schedule and calls the binary's skill-only cleanup. Direct Homebrew uninstall retains the update lock after preflight until its process exits, preventing a competing updater from restarting the daemon during package removal. Skill commands use their own lock. A timeout or cleanup error aborts removal or restart. Post-install reloads only an existing plist, preserves its config path, switches to the stable Homebrew binary link, and enrolls existing setups into updates without replacing an already registered updater. It also refreshes managed skills through the new binary, even without a service plist. See the [GoReleaser cask schema](https://goreleaser.com/customization/homebrew_casks/) and [Homebrew Cask Cookbook](https://docs.brew.sh/Cask-Cookbook#stanza-zap).
+
+## Agent skill
+
+Use temporary homes and agent directories. Keep service commands stubbed for these checks.
+
+1. Run the built binary outside the source checkout. Install the skill, then check status and all referenced files. Confirm no download or checkout is needed.
+2. Run setup with yes, no, and EOF at the skill offer. Confirm yes/no is remembered, EOF records nothing, and repeating setup keeps existing repo selections.
+3. Test shared, Claude Code, and Hermes destinations, including `CLAUDE_CONFIG_DIR` and `HERMES_HOME`. Explicit overrides must be respected. Unrelated profiles stay untouched.
+4. Install a different skill at a destination. Confirm it is preserved. Modify a managed skill or add a personal file, then refresh and uninstall. Confirm the whole customized folder survives.
+5. Upgrade a managed, unchanged copy with a newer binary. Confirm all embedded references refresh. Repeat with no receipt; refresh must create no installation.
+6. Run Homebrew post-install with and without a service plist while the update lock is held. It must invoke the new staged binary's skill refresh without prompting or taking that lock.
+7. Test full CLI uninstall, direct Homebrew uninstall, and uninstall with `--zap`. Unchanged managed copies must disappear and customized folders must remain. Upgrade and reinstall hooks must preserve skills for refresh.
+8. Make a managed destination unwritable. Confirm failure is reported and ownership remains available for retry. Restore access and retry.
+
+The Ruby harness exercises the actual cask hooks with service and helper commands intercepted. Its optional Homebrew loader check verifies the real artifact forwarding. Neither test installs packages or changes a logged-in service.
 
 ## Automatic updates
 

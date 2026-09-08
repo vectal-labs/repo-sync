@@ -10,6 +10,7 @@ repo-sync is for shared team documents and context where edits should be committ
 - GitHub HTTPS credential repair uses GitHub CLI only when needed. Homebrew installs Git and `gh`; other installations get clear instructions if a required tool is missing.
 - stale global Git TLS-version pins are ignored. if a check fails, setup reports the repo and stops before installing.
 - setup starts the service and checks that it stays running. `--no-launch` writes the files without starting or verifying the service.
+- setup then offers the optional bundled agent skill and remembers yes or no. end-of-input skips the offer without recording an answer. repeating setup refreshes previously managed, unchanged copies. skill installation does not select repos or change syncing.
 
 ## status and upgrades
 
@@ -25,6 +26,7 @@ repo-sync is for shared team documents and context where edits should be committ
 - `brew upgrade --cask repo-sync` preserves settings and logs. if a service plist already exists, the install hook updates its binary path and reloads it. it never opens interactive setup.
 - existing users must manually upgrade once to receive the updater. that upgrade enrolls an already configured service. an unconfigured Homebrew install creates no background jobs until setup.
 - after an upgrade, run `repo-sync status` to check readiness. for a Go installation, install the new binary and rerun `repo-sync setup`.
+- the binary embeds the official agent skill. `repo-sync skill install`, `status`, `refresh`, and `uninstall` manage its local copies without touching repositories or services. Homebrew post-install refreshes managed copies, including installations with no sync service. Go users rerun setup or `repo-sync skill refresh` after updating the binary. unowned or customized skill folders are preserved. see [agent skill installation](agent-skill.md).
 
 ## stop syncing one repository
 
@@ -43,6 +45,7 @@ repo-sync is for shared team documents and context where edits should be committ
 - use `--yes` for noninteractive removal or `--config /path/to/config.json` for a custom config. `--keep-binary` retains the binaries and their paths in `install.json` for later removal.
 - every run reports `Removed`, `Preserved`, and `Failed`. incomplete cleanup returns a nonzero exit code and keeps the ownership record and remaining program when possible. fix the reported failure and rerun uninstall.
 - repositories, Git history, shared Git credentials, Git, and GitHub CLI are preserved.
+- full CLI uninstall and true Homebrew uninstall remove unchanged managed skill copies. customized folders remain. Homebrew upgrades and reinstalls preserve skill registration so the new binary can refresh it. skill cleanup uses its own lock and never stops processes or invokes full uninstall.
 - `brew uninstall --cask repo-sync` stops the service but retains user files. add `--zap` to remove the standard settings, logs, cache, and plist too. Homebrew moves these files to the trash.
 
 ## syncing

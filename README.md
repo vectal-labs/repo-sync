@@ -40,6 +40,18 @@ repo-sync add ~/code/notes    # sync a repo by path
 repo-sync status             # check the service and repositories
 ```
 
+## Agent skill
+
+The binary includes an optional skill that teaches your AI agent how to set up, check, and stop repo-sync. Setup offers to install it. You can also run:
+
+```sh
+repo-sync skill install
+repo-sync skill status
+repo-sync skill uninstall
+```
+
+Homebrew upgrades refresh installed, unchanged copies. Customized files are preserved. [Installation and supported agents](docs/agent-skill.md).
+
 ## Safety
 
 - Secret filenames like `.env`, `*.pem`, and `.npmrc` are blocked by default. No content scanning.
@@ -55,7 +67,7 @@ repo-sync status             # check the service and repositories
 repo-sync uninstall
 ```
 
-Asks before removing the service, settings, logs, cache, and installed binary. Repositories and shared Git credentials are preserved. Use `--yes` to skip confirmation, or `--keep-binary` to keep the program.
+Asks before removing the service, settings, logs, cache, installed binary, and unchanged managed agent skills. Repositories, shared Git credentials, and customized skill folders are preserved. Use `--yes` to skip confirmation, or `--keep-binary` to keep the program.
 
 For Homebrew, `brew uninstall --cask --zap repo-sync` also removes the standard settings, logs, and cache. Plain `brew uninstall` stops the service and keeps those files.
 

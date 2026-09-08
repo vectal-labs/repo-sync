@@ -2,7 +2,7 @@
 
 Every code change runs formatting, vet, build, the full Go race/E2E suite, cask lifecycle tests, and release-config validation. Independent Git and daemon tests run in parallel; tests that change the process environment stay serial.
 
-Markdown, `LICENSE`, and images/PDFs under `docs/` skip heavy checks. Pull requests compare against their merge base. Main pushes also compare against the latest fully tested main commit, so a cancelled code push cannot disappear behind a later docs-only push. CI policy tests always run.
+Markdown, `LICENSE`, and images/PDFs under `docs/` skip heavy checks. Files under `.agents/skills/repo-sync/` always run full checks because they are embedded in the binary. Pull requests compare against their merge base. Main pushes also compare against the latest fully tested main commit, so a cancelled code push cannot disappear behind a later docs-only push. CI policy tests always run.
 
 A release tag reuses successful `CI` from a push to this repository's `main` only when its commit matches exactly and the Go test step actually passed. A successful docs-only run does not qualify. Missing history, failed API lookups, or no qualifying run among the latest 20 successful runs cause all checks to run. Publishing still waits for the test job to succeed.
 

@@ -6,6 +6,7 @@ require "minitest/autorun"
 require "tmpdir"
 require "fileutils"
 require "open3"
+require "pathname"
 
 # Minimal artifact interface for exercising the scoped lifecycle extension.
 module Cask
@@ -18,6 +19,10 @@ module Cask
       def uninstall_phase(**_options)
         @context.instance_eval(&@block)
       end
+
+      def cask
+        @context
+      end
     end
   end
 end
@@ -27,13 +32,15 @@ end
 class CaskLifecycleHarness
   Result = Struct.new(:exit_status, :stdout, :stderr)
   attr_reader :calls, :staged_path, :artifacts
-  attr_accessor :fail_bootstrap, :never_stops, :inspect_error
+  attr_accessor :fail_bootstrap, :never_stops, :inspect_error, :fail_skill
   attr_reader :exit_probes
+  attr_reader :skill_update_locks
 
   def initialize(root)
     @calls = []
     @root = root
-    @staged_path = File.join(root, "Caskroom", "repo-sync", "2.0.0")
+    @staged_path = Pathname.new(File.join(root, "Caskroom", "repo-sync", "2.0.0"))
+    @skill_update_locks = []
     @loaded = {}
     @old_process_alive = false
     @exit_probes = 0
@@ -109,6 +116,19 @@ class CaskLifecycleHarness
         load_updater
         return Result.new(0, "", "")
       end
+      if command == File.join(staged_path, "repo-sync") && args.first == "skill"
+        raise "unexpected skill operation" unless [%w[skill refresh], %w[skill uninstall]].include?(args)
+        raise "skill command needs a bounded timeout" unless options[:timeout] && options[:timeout] <= 30
+        if args.last == "uninstall" && (@loaded.values.any? || @old_process_alive)
+          raise "skill cleanup ran before the services stopped"
+        end
+        raise "simulated skill cleanup failure" if fail_skill
+
+        lock_path = File.join(@root, "Library", "Caches", "repo-sync", "update.lock")
+        held = File.exist?(lock_path) && File.open(lock_path, File::RDWR) { |lock| !lock.flock(File::LOCK_EX | File::LOCK_NB) }
+        @skill_update_locks << held
+        return Result.new(0, "", "")
+      end
       raise "unexpected command: #{command}"
     end
   end
@@ -182,6 +202,8 @@ class CaskLifecycleTest < Minitest::Test
     install
     refute File.exist?(@plist)
     refute @harness.calls.any? { |command, _args| command == "/bin/launchctl" }
+    skill_calls = @harness.calls.select { |_command, args| args.first == "skill" }
+    assert_equal [%w[skill refresh]], skill_calls.map { |_command, args| args }
   end
 
   def test_upgrade_preserves_custom_config_and_all_other_settings
@@ -201,7 +223,8 @@ class CaskLifecycleTest < Minitest::Test
     before = File.read(@plist)
     uninstall
     assert_equal before, File.read(@plist)
-    assert_equal ["bootout", "gui/#{Process.uid}/com.vectal-labs.repo-sync"], @harness.calls.last[1]
+    assert @harness.calls.any? { |_command, args| args == ["bootout", "gui/#{Process.uid}/com.vectal-labs.repo-sync"] }
+    assert_equal %w[skill uninstall], @harness.calls.last[1]
     assert_operator @harness.exit_probes, :>=, 3
   end
 
@@ -261,6 +284,7 @@ class CaskLifecycleTest < Minitest::Test
       assert @harness.updater_loaded?
       assert_equal "existing updater", File.read(@updater_plist)
       refute @harness.calls.any? { |_command, args| args.first == "bootout" && args.last.end_with?(".updates") }
+      refute @harness.calls.any? { |_command, args| args.first == "skill" }
     end
   end
 
@@ -272,6 +296,40 @@ class CaskLifecycleTest < Minitest::Test
     refute @harness.updater_loaded?
     refute File.exist?(@updater_plist)
     assert File.exist?(@plist)
+    assert_equal [true], @harness.skill_update_locks
+  end
+
+  def test_skill_only_uninstall_cleans_managed_skills_without_a_service
+    uninstall
+    assert_equal %w[skill uninstall], @harness.calls.last[1]
+    assert_equal [false], @harness.skill_update_locks
+  end
+
+  def test_skill_refresh_runs_while_the_updater_holds_its_lock
+    lock_path = File.join(@root, "Library", "Caches", "repo-sync", "update.lock")
+    FileUtils.mkdir_p(File.dirname(lock_path))
+    File.open(lock_path, File::RDWR | File::CREAT, 0600) do |lock|
+      assert lock.flock(File::LOCK_EX | File::LOCK_NB)
+      install
+      assert_equal [true], @harness.skill_update_locks
+    end
+  end
+
+  def test_skill_cleanup_failure_aborts_uninstall_and_releases_lock
+    write_plist(File.join(@root, "config.json"))
+    @harness.fail_skill = true
+    error = assert_raises(RuntimeError) { uninstall }
+    assert_match "skill cleanup failure", error.message
+    assert File.exist?(@plist)
+    File.open(File.join(@root, "Library", "Caches", "repo-sync", "update.lock"), File::RDWR) do |lock|
+      assert lock.flock(File::LOCK_EX | File::LOCK_NB)
+    end
+  end
+
+  def test_skill_refresh_failure_is_reported
+    @harness.fail_skill = true
+    error = assert_raises(RuntimeError) { install }
+    assert_match "skill cleanup failure", error.message
   end
 
   def test_successful_preflight_retains_lock_during_package_removal
@@ -351,15 +409,29 @@ class CaskLifecycleTest < Minitest::Test
             end
           CASK
           calls = []
+          cask = nil
           result = Struct.new(:exit_status, :stdout, :stderr)
           SystemCommand.singleton_class.send(:define_method, :run!) do |executable, **options|
-            raise "unexpected real command #{executable}" unless executable == "/bin/launchctl"
-            calls << options.fetch(:args)
-            result.new(113, "", "Could not find service")
+            args = options.fetch(:args)
+            calls << args
+            if executable == "/bin/launchctl"
+              result.new(113, "", "Could not find service")
+            elsif executable == "/usr/bin/xattr"
+              result.new(0, "", "")
+            elsif executable == cask.staged_path.join("repo-sync").to_s && [%w[skill refresh], %w[skill uninstall]].include?(args)
+              raise "skill hook timeout missing" unless options[:timeout] && options[:timeout] <= 30
+              result.new(0, "", "")
+            else
+              raise "unexpected real command #{executable} #{args}"
+            end
           end
           cask = Cask::CaskLoader::FromContentLoader.new(File.read(path)).load(config: nil)
           artifact = cask.artifacts.find { |item| item.is_a?(Cask::Artifact::PreflightBlock) }
           raise "scoped lifecycle extension missing" unless artifact.singleton_class.ancestors.any? { |ancestor| ancestor.name&.end_with?("RepoSyncCaskLifecycle::UninstallPhase") }
+          postflight = cask.artifacts.find { |item| item.is_a?(Cask::Artifact::PostflightBlock) }
+          postflight.install_phase
+          raise "fresh install missed skill refresh" unless calls.include?(%w[skill refresh])
+          raise "fresh install touched launchd" if calls.any? { |args| %w[print bootout bootstrap].include?(args.first) }
           updater_plist = File.join(root, "Library", "LaunchAgents", "com.vectal-labs.repo-sync.updates.plist")
           FileUtils.mkdir_p(File.dirname(updater_plist))
           File.write(updater_plist, "keep across upgrades")
@@ -367,12 +439,14 @@ class CaskLifecycleTest < Minitest::Test
             calls.clear
             artifact.uninstall_phase(**flags)
             raise "upgrade touched updater" if calls.any? { |args| args.last.end_with?(".updates") }
+            raise "upgrade removed skills" if calls.any? { |args| args.first == "skill" }
             raise "upgrade removed updater schedule" unless File.exist?(updater_plist)
           end
           calls.clear
           artifact.uninstall_phase(upgrade: false, reinstall: false)
           raise "uninstall missed updater" unless calls.any? { |args| args.last.end_with?(".updates") }
           raise "uninstall left updater schedule" if File.exist?(updater_plist)
+          raise "uninstall missed skill cleanup" unless calls.include?(%w[skill uninstall])
           File.open(File.join(root, "Library", "Caches", "repo-sync", "update.lock"), File::RDWR) do |lock|
             raise "preflight released update lock before package removal" if lock.flock(File::LOCK_EX | File::LOCK_NB)
           end

@@ -136,7 +136,7 @@ test('PR documentation skips heavy checks without GitHub API calls', async (t) =
   assert.equal(f.calls.length, 0);
 });
 
-for (const file of ['main.go', 'go.mod', 'scripts/check.cjs', '.github/workflows/ci.yml', 'docs/migration.sql']) {
+for (const file of ['main.go', 'go.mod', 'scripts/check.cjs', '.github/workflows/ci.yml', 'docs/migration.sql', '.agents/skills/repo-sync/SKILL.md', '.agents/skills/repo-sync/references/operations.md']) {
   test(`changes to ${file} run full checks`, async (t) => {
     const f = fixture(t);
     f.context.ref = 'refs/heads/main';
@@ -145,6 +145,24 @@ for (const file of ['main.go', 'go.mod', 'scripts/check.cjs', '.github/workflows
     assert.equal(f.calls.length, 0);
   });
 }
+
+test('removing an embedded skill reference runs full checks', async (t) => {
+  const f = fixture(t);
+  const reference = '.agents/skills/repo-sync/references/operations.md';
+  const base = f.commit({ [reference]: 'embedded instructions\n' });
+  f.context.eventName = 'pull_request';
+  f.context.payload.pull_request = { base: { sha: base } };
+  f.commit({ [reference]: null });
+  assert.equal(await f.check(), true);
+});
+
+test('PR embedded skill changes cannot skip heavy checks', async (t) => {
+  const f = fixture(t);
+  f.context.eventName = 'pull_request';
+  f.context.payload.pull_request = { base: { sha: f.base } };
+  f.commit({ '.agents/skills/repo-sync/SKILL.md': 'embedded instructions\n' });
+  assert.equal(await f.check(), true);
+});
 
 test('renaming code into documentation still runs checks', async (t) => {
   const f = fixture(t);
