@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -108,6 +109,7 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 	for _, process := range processes {
 		fmt.Fprintf(opts.out, "Stop process: %d (%s)\n", process.PID, process.Executable)
 	}
+	fmt.Fprintln(opts.out, "Unchanged managed agent skills will be removed; customized folders are preserved.")
 	fmt.Fprintln(opts.out, "Repositories, Git history, shared tools, and credentials are preserved.")
 	if !opts.yes {
 		fmt.Fprint(opts.out, "Type yes to uninstall: ")
@@ -145,6 +147,20 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 		return fail(err)
 	}
 	report.preserved = append(report.preserved, plan.preserved...)
+	// Keep skill operations serialized until final lock-file cleanup. The
+	// Homebrew uninstall hook sees the removed receipt and becomes a no-op.
+	unlockSkills, err := lockUpdateFile(skillLockPath(), syscall.LOCK_EX)
+	if err != nil {
+		return fail(err)
+	}
+	defer unlockSkills()
+	skillRecord, err := readSkillRecord()
+	if err != nil {
+		return fail(err)
+	}
+	if err := (skillManager{out: opts.out}).uninstall(skillRecord); err != nil {
+		return fail(fmt.Errorf("remove agent skill: %w", err))
+	}
 	// Save discoveries before deleting the plist, so a partial uninstall can be retried.
 	if err := writeInstallRecord(plan.record); err != nil {
 		return fail(fmt.Errorf("save cleanup record: %w", err))
@@ -204,7 +220,7 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 	}
 	if len(report.failed) == 0 {
 		// Both jobs and owned processes are stopped before removing lock files.
-		for _, name := range []string{"sync.lock", "update.lock"} {
+		for _, name := range []string{"sync.lock", "update.lock", "skill.lock"} {
 			path := filepath.Join(home, "Library", "Caches", "repo-sync", name)
 			if err := safeRemovalPath(home, path); err != nil {
 				report.failed = append(report.failed, err.Error())

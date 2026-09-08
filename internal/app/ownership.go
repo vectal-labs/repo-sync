@@ -114,7 +114,7 @@ func validateInstallConfigPath(path string) error {
 		return err
 	}
 	canonical := canonicalInstallPath(path)
-	for _, reserved := range []string{installRecordPath(), updateSettingsPath(), filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist"), updaterService(nil).plistPath(home)} {
+	for _, reserved := range []string{installRecordPath(), skillRecordPath(), updateSettingsPath(), filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist"), updaterService(nil).plistPath(home)} {
 		if canonical == canonicalInstallPath(reserved) {
 			return fmt.Errorf("config path %s conflicts with repo-sync's installation files", path)
 		}

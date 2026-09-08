@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 const launchAgentLabel = "com.vectal-labs.repo-sync"
 
 type setupOptions struct {
+	skill      fs.FS
 	configPath string
 	binary     string // installed repo-sync binary the LaunchAgent should run
 	noLaunch   bool
@@ -214,6 +216,7 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 		fmt.Fprintf(opts.out, "Service is running with %d repositories. Starts automatically at login.\n", len(cfg.Repositories))
 	}
 	fmt.Fprintf(opts.out, "Config: %s\nLogs: %s\nCheck progress: %s\nRemove: %s\n", opts.configPath, logDir, configCommand("status", opts.configPath), configCommand("uninstall", opts.configPath))
+	(skillManager{bundle: opts.skill, out: opts.out}).offer(input)
 	return nil
 }
 

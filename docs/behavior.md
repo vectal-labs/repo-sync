@@ -26,7 +26,7 @@ repo-sync is for shared team documents and context where edits should be committ
 - `brew upgrade --cask repo-sync` preserves settings and logs. if a service plist already exists, the install hook updates its binary path and reloads it. it never opens interactive setup.
 - existing users must manually upgrade once to receive the updater. that upgrade enrolls an already configured service. an unconfigured Homebrew install creates no background jobs until setup.
 - after an upgrade, run `repo-sync status` to check readiness. for a Go installation, install the new binary and rerun `repo-sync setup`.
-- the binary embeds the official agent skill. `repo-sync skill install`, `status`, `refresh`, and `uninstall` manage its local copies without touching repositories or services. Homebrew post-install refreshes managed copies, including installations with no sync service. Go users rerun setup or `repo-sync skill refresh` after updating the binary. unowned or customized skill folders are preserved. see [agent skill installation](agent-skill.md).
+- the binary embeds the official agent skill. `repo-sync skill install`, `status`, `refresh`, and `uninstall` manage its local copies without touching repositories or services. Homebrew post-install refreshes managed copies, including installations with no sync service. Go users rerun setup or `repo-sync skill refresh` after updating the binary. explicit installation may adopt an identical unowned copy; other unowned or customized skill folders are preserved. see [agent skill installation](agent-skill.md).
 
 ## stop syncing one repository
 

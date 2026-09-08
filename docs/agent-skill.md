@@ -16,7 +16,9 @@ The installer uses the shared `~/.agents/skills/repo-sync` folder, discovered by
 - Claude Code: `${CLAUDE_CONFIG_DIR:-~/.claude}/skills/repo-sync`.
 - Hermes: `${HERMES_HOME:-~/.hermes}/skills/repo-sync`.
 
-Explicit environment overrides are respected. The installer does not populate every agent profile. Check `skill status` for the actual paths and any preserved folders. Start a new agent session after installation. Local installation does not configure cloud agents.
+Existing Pi or Cursor copies are also checked because they can take precedence over the shared folder. Pi uses `${PI_CODING_AGENT_DIR:-~/.pi/agent}/skills/repo-sync`. New installations avoid these duplicate copies.
+
+Explicit environment overrides are respected. The installer does not populate every agent profile. Check the install output for preserved folders and `skill status` for managed paths. Start a new agent session after installation. Local installation does not configure cloud agents.
 
 Homebrew upgrades refresh previously managed, unchanged copies automatically. Go users should rerun setup after upgrading the binary, or refresh the skill separately:
 
@@ -24,7 +26,7 @@ Homebrew upgrades refresh previously managed, unchanged copies automatically. Go
 repo-sync skill refresh
 ```
 
-Refresh installs nothing when no managed installation exists. Existing unowned folders and customized managed folders are preserved, including their extra files. The CLI reports conflicts instead of replacing personal instructions.
+Refresh installs nothing when no managed installation exists. Explicit `skill install` can adopt an existing folder that exactly matches the bundled skill. Other unowned folders and customized managed folders are preserved, including extra files, directories, and symlinks. The CLI reports preserved folders instead of replacing personal instructions. Interrupted operations retain a receipt so they can be retried; later custom edits are still protected.
 
 To remove managed skill copies while keeping repo-sync:
 

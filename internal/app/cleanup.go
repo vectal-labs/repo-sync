@@ -263,7 +263,7 @@ func scanCleanupDirectory(home, dir string, reportUnknown bool, matches func(str
 	}
 	for _, entry := range entries {
 		path := filepath.Join(dir, entry.Name())
-		if path == installRecordPath() || path == filepath.Join(updateCacheDir(), "update.lock") || path == updateGatePath() || containsPath(plan.files, path) {
+		if path == installRecordPath() || path == skillRecordPath() || path == skillLockPath() || path == filepath.Join(updateCacheDir(), "update.lock") || path == updateGatePath() || containsPath(plan.files, path) {
 			continue
 		}
 		if matches(entry.Name()) && !entry.IsDir() {

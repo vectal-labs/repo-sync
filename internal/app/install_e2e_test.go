@@ -24,6 +24,9 @@ func TestLaunchdInstallSyncRestartAndUninstall(t *testing.T) {
 	t.Setenv("GOMODCACHE", strings.TrimSpace(string(moduleCache)))
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("HERMES_HOME", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
 	root, err := filepath.Abs("../..")
@@ -62,11 +65,14 @@ func TestLaunchdInstallSyncRestartAndUninstall(t *testing.T) {
 			t.Errorf("clean up temporary service: %v", err)
 		}
 	})
-	opts := setupOptions{configPath: configPath, binary: binary, in: strings.NewReader("\n"), runner: execCommandRunner{}, service: service}
+	opts := setupOptions{skill: testSkillBundle("launchd fixture"), configPath: configPath, binary: binary, in: strings.NewReader("\nyes\n"), runner: execCommandRunner{}, service: service}
 	var out strings.Builder
 	opts.out = &out
 	if err := runSetup(context.Background(), opts); err != nil {
 		t.Fatalf("install: %v\n%s", err, out.String())
+	}
+	if got := skillRead(t, filepath.Join(home, ".agents", "skills", "repo-sync", "SKILL.md")); got != "launchd fixture" {
+		t.Fatalf("setup did not install offered skill: %s", got)
 	}
 	if state, err := updaterService(service).inspect(context.Background()); err != nil || !state.loaded {
 		t.Fatalf("updater was not registered: %+v, %v", state, err)
@@ -129,7 +135,7 @@ func TestLaunchdInstallSyncRestartAndUninstall(t *testing.T) {
 	if err != nil || final.loaded {
 		t.Fatalf("service remains: %+v %v", final, err)
 	}
-	for _, path := range []string{binary, configPath, statusPath(configPath), service.plistPath(home), updaterService(service).plistPath(home), filepath.Join(home, "Library", "Logs", "repo-sync")} {
+	for _, path := range []string{binary, skillRecordPath(), filepath.Join(home, ".agents", "skills", "repo-sync"), configPath, statusPath(configPath), service.plistPath(home), updaterService(service).plistPath(home), filepath.Join(home, "Library", "Logs", "repo-sync")} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("uninstall left %s: %v", path, err)
 		}

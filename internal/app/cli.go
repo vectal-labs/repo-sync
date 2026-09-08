@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,16 +19,17 @@ const usage = `usage: repo-sync <command> [options]
   remove [path]         stop syncing a repository; keep its files and Git history
   allow <path>          let a secret-guarded file in the current repository sync
   status                show service readiness and repository health
+  skill <command>       install, refresh, inspect, or remove the bundled agent skill
   version               show the installed version
   update                check and install the latest Homebrew release now
   updates on|off         enable automatic updates or keep notifications only
   uninstall             remove the service, settings, logs, and program
   run                   run the sync service in the foreground (used by launchd)
 
-Every command accepts --config <path>.`
+Sync commands accept --config <path>. Agent skills are shared across configs.`
 
 // Run executes a repo-sync command.
-func Run(args []string) error {
+func Run(args []string, bundle fs.FS) error {
 	command := "help"
 	if len(args) > 0 {
 		command = args[0]
@@ -40,6 +42,15 @@ func Run(args []string) error {
 	configPath := flags.String("config", defaultConfigPath(), "config file")
 
 	switch command {
+	case "skill":
+		if len(args) == 0 || (len(args) == 1 && (args[0] == "help" || args[0] == "--help" || args[0] == "-h")) {
+			fmt.Println(skillUsage)
+			return nil
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("%s", skillUsage)
+		}
+		return (skillManager{bundle: bundle, out: os.Stdout}).run(args[0])
 	case "version":
 		if err := flags.Parse(args); err != nil {
 			return err
@@ -103,7 +114,7 @@ func Run(args []string) error {
 			return err
 		}
 		return runSetup(context.Background(), setupOptions{
-			configPath: *configPath, binary: binary, noLaunch: *noLaunch, in: os.Stdin, out: os.Stdout,
+			configPath: *configPath, binary: binary, noLaunch: *noLaunch, in: os.Stdin, out: os.Stdout, skill: bundle,
 		})
 	case "status":
 		if err := flags.Parse(args); err != nil {
