@@ -32,8 +32,8 @@ type cleanupReport struct{ removed, preserved, failed []string }
 
 var (
 	ownedTemporary = regexp.MustCompile(`^\.repo-sync-[0-9]+$`)
-	ownedLog       = regexp.MustCompile(`^(stdout|stderr)\.log(\.[0-9]+(\.gz)?)?$`)
-	ownedStatus    = regexp.MustCompile(`^status-[a-f0-9]{64}\.json$`)
+	ownedLog       = regexp.MustCompile(`^(updates-)?(stdout|stderr)\.log(\.[0-9]+(\.gz)?)?$`)
+	ownedStatus    = regexp.MustCompile(`^(status|updates)-[a-f0-9]{64}\.json$`)
 )
 
 func appDirectories(home string) []string {
@@ -57,7 +57,12 @@ func buildCleanupPlan(home string, opts uninstallOptions, service *launchService
 	if installed != "" {
 		configPaths = append(configPaths, installed)
 	}
-	plan.files = append(plan.files, service.plistPath(home))
+	if installed, err := installedConfigPath(updaterService(service).plistPath(home)); err != nil {
+		return plan, err
+	} else if installed != "" {
+		configPaths = append(configPaths, installed)
+	}
+	plan.files = append(plan.files, service.plistPath(home), updaterService(service).plistPath(home), updateSettingsPath())
 	for _, path := range uniquePaths(configPaths) {
 		if path == "." || path == "" {
 			continue
@@ -79,7 +84,7 @@ func buildCleanupPlan(home string, opts uninstallOptions, service *launchService
 			}
 		}
 		plan.record.ConfigPaths = append(plan.record.ConfigPaths, absolute)
-		plan.files = append(plan.files, absolute, statusPath(absolute))
+		plan.files = append(plan.files, absolute, statusPath(absolute), updateStatePath(absolute))
 	}
 	if err := scanCleanupArtifacts(home, service, &plan); err != nil {
 		return plan, err
@@ -258,7 +263,7 @@ func scanCleanupDirectory(home, dir string, reportUnknown bool, matches func(str
 	}
 	for _, entry := range entries {
 		path := filepath.Join(dir, entry.Name())
-		if path == installRecordPath() || containsPath(plan.files, path) {
+		if path == installRecordPath() || path == filepath.Join(updateCacheDir(), "update.lock") || path == updateGatePath() || containsPath(plan.files, path) {
 			continue
 		}
 		if matches(entry.Name()) && !entry.IsDir() {

@@ -246,7 +246,7 @@ func setupOwnershipReadyService(t *testing.T, runner *lifecycleRunner, configPat
 	t.Helper()
 	return &launchService{domain: "gui/test", label: launchAgentLabel, runner: preflightRunnerFunc(func(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
 		output, err := runner.run(ctx, dir, stdin, name, args...)
-		if err == nil && args[0] == "bootstrap" && runner.starts == 1 {
+		if err == nil && args[0] == "bootstrap" && !strings.HasSuffix(args[len(args)-1], ".updates.plist") && runner.starts == 1 {
 			runner.pid = 99999999
 			onFirstStart()
 			cfg, err := loadConfig(configPath)

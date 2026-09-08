@@ -16,17 +16,33 @@ import (
 )
 
 type uninstallRunner struct {
-	label     string
-	loaded    bool
-	stopError error
-	brewError error
-	calls     [][]string
-	brewPaths []string
+	updaterLoaded bool
+	label         string
+	loaded        bool
+	stopError     error
+	brewError     error
+	calls         [][]string
+	brewPaths     []string
 }
 
 func (r *uninstallRunner) run(_ context.Context, _, _, name string, args ...string) (string, error) {
 	r.calls = append(r.calls, append([]string{name}, args...))
 	if name == "/bin/launchctl" && len(args) > 0 {
+		if strings.HasSuffix(args[len(args)-1], ".updates") {
+			switch args[0] {
+			case "print":
+				if r.updaterLoaded {
+					return "state = waiting", nil
+				}
+				return "Could not find service " + r.label + ".updates", errors.New("service not found")
+			case "bootout":
+				if r.stopError != nil {
+					return "", r.stopError
+				}
+				r.updaterLoaded = false
+				return "", nil
+			}
+		}
 		switch args[0] {
 		case "print":
 			if r.loaded {
@@ -78,7 +94,7 @@ func newUninstallFixture(t *testing.T) uninstallFixture {
 	binaryData := uninstallBinaryBytes(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	runner := &uninstallRunner{label: "test.repo-sync.uninstall", loaded: true}
+	runner := &uninstallRunner{label: "test.repo-sync.uninstall", loaded: true, updaterLoaded: true}
 	service := &launchService{runner: runner, domain: "gui/test", label: runner.label}
 	f := uninstallFixture{
 		home: home, binary: filepath.Join(home, "go", "bin", "repo-sync"),
@@ -110,7 +126,9 @@ func newUninstallFixture(t *testing.T) uninstallFixture {
 	uninstallWrite(t, statusPath(f.config), "{\"pid\":0}\n", 0o600)
 	uninstallWrite(t, filepath.Join(f.logs, "stdout.log"), "ordinary output\n", 0o600)
 	uninstallWrite(t, filepath.Join(f.logs, "stderr.log"), "ordinary error\n", 0o600)
-	f.installed = []string{f.binary, f.config, f.plist, statusPath(f.config), filepath.Join(f.logs, "stdout.log"), filepath.Join(f.logs, "stderr.log")}
+	updaterPath := updaterService(service).plistPath(home)
+	uninstallWrite(t, updaterPath, updaterPlist(service.label+".updates", f.binary, f.config, f.logs), 0o644)
+	f.installed = []string{f.binary, f.config, f.plist, statusPath(f.config), filepath.Join(f.logs, "stdout.log"), filepath.Join(f.logs, "stderr.log"), updaterPath}
 	return f
 }
 

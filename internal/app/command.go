@@ -26,9 +26,10 @@ type commandRunner interface {
 }
 
 type execCommandRunner struct {
-	path string
-	env  []string
-	warn func(format string, args ...any) // receives stderr of successful commands; nil drops it
+	path    string
+	env     []string
+	timeout time.Duration                    // zero keeps the normal two-minute Git timeout
+	warn    func(format string, args ...any) // receives stderr of successful commands; nil drops it
 }
 
 func backgroundRunner() execCommandRunner {
@@ -87,7 +88,11 @@ var (
 )
 
 func (r execCommandRunner) run(ctx context.Context, dir, stdin, name string, args ...string) (string, error) {
-	commandCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	timeout := r.timeout
+	if timeout == 0 {
+		timeout = 2 * time.Minute
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := r.command(commandCtx, name, args...)
 	cmd.Dir = dir

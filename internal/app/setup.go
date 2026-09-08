@@ -53,32 +53,17 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 		return err
 	}
 	plistPath := service.plistPath(home)
+	updater := updaterService(service)
+	updaterPlistPath := updater.plistPath(home)
+	previousUpdaterPlist, err := snapshotFile(updaterPlistPath)
+	if err != nil {
+		return err
+	}
 	previousPlist, err := snapshotFile(plistPath)
 	if err != nil {
 		return err
 	}
-	configPaths := []string{opts.configPath}
-	if previousPlist.exists {
-		installed, err := installedConfigPath(plistPath)
-		if err != nil {
-			return err
-		}
-		if installed == "" {
-			installed = defaultConfigPath()
-		}
-		configPaths = append(configPaths, installed)
-		previousBinary, err := installedBinaryPath(plistPath)
-		if err != nil {
-			return err
-		}
-		if previousBinary != "" {
-			record, err = mergeInstallation(record, nil, previousBinary)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	record, err = mergeInstallation(record, configPaths, opts.binary)
+	record, err = setupInstallationRecord(record, opts.configPath, opts.binary, plistPath, previousPlist.exists)
 	if err != nil {
 		return err
 	}
@@ -117,6 +102,30 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	if err := verifyRepositories(ctx, runner, cfg.Repositories, input, opts.out); err != nil {
 		return err
 	}
+	unlockUpdates, err := acquireUpdateLock()
+	if err != nil {
+		return err
+	}
+	defer unlockUpdates()
+	// An update may finish while the user chooses repositories. Rollback must
+	// preserve that installation, including its latest executable path.
+	for _, saved := range []struct {
+		path     string
+		snapshot *fileSnapshot
+	}{{installRecordPath(), &previousRecord}, {plistPath, &previousPlist}, {updaterPlistPath, &previousUpdaterPlist}} {
+		*saved.snapshot, err = snapshotFile(saved.path)
+		if err != nil {
+			return err
+		}
+	}
+	record, err = loadInstallRecord()
+	if err != nil {
+		return err
+	}
+	record, err = setupInstallationRecord(record, opts.configPath, opts.binary, plistPath, previousPlist.exists)
+	if err != nil {
+		return err
+	}
 	logDir := filepath.Join(home, "Library", "Logs", "repo-sync")
 	if opts.noLaunch {
 		fmt.Fprintln(opts.out, "\n4/4 Save service files")
@@ -128,24 +137,35 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	if err != nil {
 		return err
 	}
-	wasLoaded := false
+	wasLoaded, updaterWasLoaded := false, false
 	if !opts.noLaunch {
 		prior, err := service.inspect(ctx)
 		if err != nil {
 			return err
 		}
 		wasLoaded = prior.loaded
+		priorUpdater, err := updater.inspect(ctx)
+		if err != nil {
+			return err
+		}
+		updaterWasLoaded = priorUpdater.loaded
 	}
 	rollback := func(cause error) error {
 		var restoreErrors []error
 		if !opts.noLaunch {
+			if err := updater.stop(ctx); err != nil {
+				return fmt.Errorf("%w; cannot restore files while the updater may still be running: %v", cause, err)
+			}
 			if err := service.stop(ctx); err != nil {
 				return fmt.Errorf("%w; cannot restore files while the new service may still be running: %v", cause, err)
 			}
 		}
-		restoreErrors = append(restoreErrors, previousConfig.restore(opts.configPath), previousPlist.restore(plistPath), previousRecord.restore(installRecordPath()))
+		restoreErrors = append(restoreErrors, previousConfig.restore(opts.configPath), previousPlist.restore(plistPath), previousRecord.restore(installRecordPath()), previousUpdaterPlist.restore(updaterPlistPath))
 		if wasLoaded {
 			restoreErrors = append(restoreErrors, service.start(ctx, plistPath))
+		}
+		if updaterWasLoaded {
+			restoreErrors = append(restoreErrors, updater.start(ctx, updaterPlistPath))
 		}
 		if restoreErr := errors.Join(restoreErrors...); restoreErr != nil {
 			return fmt.Errorf("%w; restoring previous setup also failed: %v", cause, restoreErr)
@@ -153,7 +173,13 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 		return fmt.Errorf("%w; previous setup restored", cause)
 	}
 	if !opts.noLaunch {
+		if err := updater.stop(ctx); err != nil {
+			return err
+		}
 		if err := service.stop(ctx); err != nil {
+			if updaterWasLoaded {
+				err = errors.Join(err, updater.start(ctx, updaterPlistPath))
+			}
 			return err
 		}
 	}
@@ -178,6 +204,10 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	if err := writeInstallRecord(record); err != nil {
 		return rollback(err)
 	}
+	if err := installUpdater(ctx, opts.configPath, opts.binary, opts.noLaunch, service); err != nil {
+		return rollback(fmt.Errorf("install updater: %w", err))
+	}
+	fmt.Fprintln(opts.out, "Checks for updates daily. Homebrew installations update automatically unless disabled with `repo-sync updates off`. Other installations receive upgrade notifications.")
 	if opts.noLaunch {
 		fmt.Fprintln(opts.out, "Files saved. The service was not started (--no-launch).")
 	} else {
@@ -185,6 +215,31 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 	}
 	fmt.Fprintf(opts.out, "Config: %s\nLogs: %s\nCheck progress: %s\nRemove: %s\n", opts.configPath, logDir, configCommand("status", opts.configPath), configCommand("uninstall", opts.configPath))
 	return nil
+}
+
+func setupInstallationRecord(record installRecord, configPath, binary, plistPath string, plistExists bool) (installRecord, error) {
+	configPaths := []string{configPath}
+	if plistExists {
+		installed, err := installedConfigPath(plistPath)
+		if err != nil {
+			return installRecord{}, err
+		}
+		if installed == "" {
+			installed = defaultConfigPath()
+		}
+		configPaths = append(configPaths, installed)
+		previousBinary, err := installedBinaryPath(plistPath)
+		if err != nil {
+			return installRecord{}, err
+		}
+		if previousBinary != "" {
+			record, err = mergeInstallation(record, nil, previousBinary)
+			if err != nil {
+				return installRecord{}, err
+			}
+		}
+	}
+	return mergeInstallation(record, configPaths, binary)
 }
 
 // executablePath returns the binary launchd should run. Setup refuses to point

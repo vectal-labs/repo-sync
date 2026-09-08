@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 type serviceStatus struct {
 	PID          int                `json:"pid"`
+	Version      string             `json:"version"`
 	ConfigHash   string             `json:"config_hash"`
 	UpdatedAt    time.Time          `json:"updated_at"`
 	Repositories []repositoryStatus `json:"repositories"`
@@ -39,7 +41,7 @@ func configHash(cfg config) string {
 }
 
 func (d *daemon) statusSnapshot() serviceStatus {
-	status := serviceStatus{PID: os.Getpid(), ConfigHash: configHash(d.cfg), UpdatedAt: time.Now()}
+	status := serviceStatus{PID: os.Getpid(), Version: appVersion(), ConfigHash: configHash(d.cfg), UpdatedAt: time.Now()}
 	for _, state := range d.states {
 		state.mu.Lock()
 		repo := repositoryStatus{Name: state.config.Name, State: "waiting", LastSuccess: state.lastSuccess}
@@ -121,9 +123,22 @@ func (s *launchService) readStatus(ctx context.Context, configPath string) (serv
 }
 
 func runStatus(ctx context.Context, configPath string, service *launchService, out io.Writer) error {
+	installedVersion := appVersion()
+	fmt.Fprintf(out, "Installed version: %s\n", installedVersion)
+	updateErr := printUpdateStatus(configPath, out)
 	status, err := service.readStatus(ctx, configPath)
 	if err != nil {
-		return err
+		fmt.Fprintln(out, "Running version: unavailable")
+		return errors.Join(updateErr, err)
+	}
+	if status.Version == "" {
+		fmt.Fprintln(out, "Running version: unknown (this service predates version reporting)")
+	} else {
+		fmt.Fprintf(out, "Running version: %s\n", status.Version)
+	}
+	var versionErr error
+	if stableReleaseVersion(installedVersion) && stableReleaseVersion(status.Version) && compareReleaseVersions(installedVersion, status.Version) != 0 {
+		versionErr = fmt.Errorf("running version %s differs from installed version %s; run `%s`", status.Version, installedVersion, configCommand("update", configPath))
 	}
 	fmt.Fprintf(out, "Service is running (PID %d). Starts automatically at login.\n", status.PID)
 	unhealthy := false
@@ -144,9 +159,9 @@ func runStatus(ctx context.Context, configPath string, service *launchService, o
 		fmt.Fprintln(out, "No repositories configured. Run `repo-sync setup`.")
 	}
 	if unhealthy {
-		return fmt.Errorf("some repositories need attention; retries continue automatically")
+		return errors.Join(updateErr, versionErr, fmt.Errorf("some repositories need attention; retries continue automatically"))
 	}
-	return nil
+	return errors.Join(updateErr, versionErr)
 }
 
 func configCommand(command, configPath string) string {

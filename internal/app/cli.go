@@ -17,6 +17,9 @@ const usage = `usage: repo-sync <command> [options]
   add [path]            start syncing a repository (defaults to the current one)
   allow <path>          let a secret-guarded file in the current repository sync
   status                show service readiness and repository health
+  version               show the installed version
+  update                check and install the latest Homebrew release now
+  updates on|off         enable automatic updates or keep notifications only
   uninstall             remove the service, settings, logs, and program
   run                   run the sync service in the foreground (used by launchd)
 
@@ -29,10 +32,53 @@ func Run(args []string) error {
 		command = args[0]
 		args = args[1:]
 	}
+	if command == "update-command-supervisor" {
+		return runUpdateCommandSupervisor(args)
+	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	configPath := flags.String("config", defaultConfigPath(), "config file")
 
 	switch command {
+	case "version":
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("usage: repo-sync version")
+		}
+		fmt.Println("repo-sync " + appVersion())
+		return nil
+	case "updates":
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() != 1 || (flags.Arg(0) != "on" && flags.Arg(0) != "off") {
+			return fmt.Errorf("usage: repo-sync updates on|off")
+		}
+		return setAutomaticUpdates(flags.Arg(0) == "on", os.Stdout)
+	case "update":
+		scheduled := flags.Bool("scheduled", false, "run a due background check")
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("usage: repo-sync update [--config path]")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runUpdate(ctx, *configPath, *scheduled, os.Stdout)
+	case "install-updater":
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("usage: repo-sync install-updater [--config path]")
+		}
+		binary, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		return installUpdater(context.Background(), *configPath, binary, false, defaultService())
 	case "run":
 		if err := flags.Parse(args); err != nil {
 			return err

@@ -13,8 +13,17 @@ repo-sync is for shared team documents and context where edits should be committ
 
 ## status and upgrades
 
-- `repo-sync status` checks the service and reports repository health. a service failure or a repo retrying after an error returns a nonzero exit code. it does not commit or push changes. pass `--config /path/to/config.json` for custom settings.
+- `repo-sync version` prints the installed release. development builds report `dev`.
+- `repo-sync status` shows installed and running versions, latest known release, update settings/result, and repository health. service failures, mismatched running releases, failed updates, and repositories retrying errors return a nonzero exit code. update details remain visible if the daemon is stopped. status uses cached update information and does not commit, push, or contact release servers. pass `--config /path/to/config.json` for custom settings.
+- setup installs a separate updater. Homebrew cask installations update automatically by default. other installations receive a notification naming the installation to update manually. development builds are never automatically replaced.
+- `repo-sync updates off` disables automatic installation and keeps notifications. `repo-sync updates on` re-enables it. settings take effect without restarting the sync daemon and survive upgrades and repeated setup. `repo-sync update` checks immediately and upgrades a Homebrew cask even when automatic installation is disabled; it does not re-enable the setting.
+- checks run daily. a separate LaunchAgent wakes every 15 minutes and after sleep to check whether work is due. failed checks retry every 15 minutes. short network or Homebrew failures stay quiet; failures lasting 24 hours notify once. installation/restart failures notify immediately. manual-action reminders notify once per release. notification settings may hide banners, so status always retains the result.
+- the updater checks stable GitHub releases, refreshes Homebrew metadata, and requires the cask to match the release. it targets `vectal-labs/tap/repo-sync`; Homebrew may also update required dependencies. pinned or disabled casks require manual action. a stale tap retries and eventually notifies. prereleases and downgrades are refused.
+- downloads finish before the updater waits for active Git work. the daemon and updater share an operating-system lock: existing sync cycles finish, new cycles wait, and a busy cycle postpones the upgrade. concurrent update/setup/uninstall operations are refused. the setting is checked again before installation, so turning automatic updates off during a download prevents installation.
+- Homebrew runs under a separate supervisor which retains the locks until its subprocesses stop. a timeout or an updater crash cancels the package operation and cleans up its descendants, including Homebrew's separate process groups. if macOS cannot establish that cleanup is complete, exclusion stays held and the reason is logged.
+- success requires the installed binary and configured daemon to report the expected version with fresh readiness. Homebrew owns package rollback. after an installation failure, repo-sync attempts to restart the verified binary Homebrew preserved; recovery is best effort, and unresolved failures remain visible. update failures never trigger automatic edits to repositories or Git history.
 - `brew upgrade --cask repo-sync` preserves settings and logs. if a service plist already exists, the install hook updates its binary path and reloads it. it never opens interactive setup.
+- existing users must manually upgrade once to receive the updater. that upgrade enrolls an already configured service. an unconfigured Homebrew install creates no background jobs until setup.
 - after an upgrade, run `repo-sync status` to check readiness. for a Go installation, install the new binary and rerun `repo-sync setup`.
 
 ## uninstall
@@ -92,6 +101,7 @@ repo-sync is for shared team documents and context where edits should be committ
 - logs: `~/Library/Logs/repo-sync/`.
 - runtime status: `~/Library/Caches/repo-sync/`. kept separate from custom config files so health updates do not change your repos.
 - service: `~/Library/LaunchAgents/com.vectal-labs.repo-sync.plist`. it starts at login and restarts on crash.
+- updater: `~/Library/LaunchAgents/com.vectal-labs.repo-sync.updates.plist`. update preferences live in `~/Library/Application Support/repo-sync/update-settings.json`; results and locks live in the standard cache folder. update logs use `updates-stdout.log` and `updates-stderr.log`. uninstall removes both jobs and their owned files.
 
 ## development
 

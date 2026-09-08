@@ -46,6 +46,8 @@ jobs:
         run: go test -race -count=1 ./...
       - if: steps.plan.outputs.result == 'true'
         run: ruby scripts/test-cask.rb
+        env:
+          REPO_SYNC_HOMEBREW_TEST: "1"
       - uses: goreleaser/goreleaser-action@v6
         if: steps.plan.outputs.result == 'true'
         with:

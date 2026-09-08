@@ -87,6 +87,13 @@ func TestUninstallRemovesOwnedLeftoversAndReportsPersonalFiles(t *testing.T) {
 	}
 	writeUninstallRecord(t, []string{f.config, custom}, []string{f.binary})
 	owned := []string{
+		updateSettingsPath(),
+		updateStatePath(f.config),
+		filepath.Join(cache, "updates-"+strings.Repeat("a", 64)+".json"),
+		filepath.Join(cache, "sync.lock"),
+		filepath.Join(cache, "update.lock"),
+		filepath.Join(f.logs, "updates-stdout.log"),
+		filepath.Join(f.logs, "updates-stderr.log.2.gz"),
 		filepath.Join(cache, "status-"+strings.Repeat("b", 64)+".json"),
 		filepath.Join(filepath.Dir(f.config), ".repo-sync-12345"),
 		filepath.Join(cache, ".repo-sync-45678"),
@@ -99,6 +106,7 @@ func TestUninstallRemovesOwnedLeftoversAndReportsPersonalFiles(t *testing.T) {
 		uninstallWrite(t, path, "old repo-sync state", 0o600)
 	}
 	personal := []string{
+		filepath.Join(cache, "updates-personal.json"),
 		filepath.Join(f.logs, "personal.log"),
 		filepath.Join(f.logs, "stdout.log.backup"),
 		filepath.Join(f.logs, "stderr.log.2.gz.notes"),
@@ -126,7 +134,7 @@ func TestUninstallRemovesOwnedLeftoversAndReportsPersonalFiles(t *testing.T) {
 	assertUninstallReport(t, out.String(), "Removed", append(owned, custom)...)
 	// Unknown files in app-owned folders are reported. A custom config may live
 	// directly in HOME, so its unrelated siblings do not need to be enumerated.
-	assertUninstallReport(t, out.String(), "Preserved", personal[:7]...)
+	assertUninstallReport(t, out.String(), "Preserved", personal[:8]...)
 	assertUninstallReport(t, out.String(), "Preserved", installRecordPath())
 	assertUninstallReport(t, out.String(), "Failed")
 	if !strings.Contains(out.String(), "repo-sync uninstalled.") {

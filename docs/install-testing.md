@@ -7,6 +7,7 @@ go build ./...
 go vet ./...
 go test -race -count=1 ./...
 ruby scripts/test-cask.rb
+REPO_SYNC_HOMEBREW_TEST=1 ruby scripts/test-cask.rb
 goreleaser check --config .github/.goreleaser.yaml
 ```
 
@@ -14,9 +15,10 @@ The real launchd lifecycle test uses a unique temporary service label and throwa
 
 ```sh
 REPO_SYNC_LAUNCHD_TEST=1 go test -race ./internal/app -run '^TestLaunchdInstallSyncRestartAndUninstall$' -count=1
+REPO_SYNC_LAUNCHD_TEST=1 go test -race ./internal/app -run '^TestLaunchdUpdateWaitsForGitRecoversAndRunsNewRelease$' -count=1
 ```
 
-It verifies service readiness, real syncing, repeated setup, failed-start rollback, and uninstall. It does not touch the normal repo-sync service.
+These verify both LaunchAgents, service readiness, real syncing, repeated setup, failed-start rollback, and uninstall. The updater test holds a real Git hook, verifies deferral, recovers from a controlled upgrade failure, then starts a newer compiled release and verifies real pushes. Homebrew operations are intercepted; the normal repo-sync service and installed packages remain untouched.
 
 Automated cleanup tests use disposable compiled binaries and injected process/service controls. They cover old configs, duplicate binaries, generated leftovers, preserved personal files, failed deletion, and retries. The foreground end-to-end test stops 2 real repo-sync binaries while preserving an unrelated process and staged Git work. Native process tests verify identity checks and graceful shutdown; processes whose executable macOS hides cannot be identified.
 
@@ -27,7 +29,7 @@ Use a disposable macOS account or VM for Homebrew and launchd checks. Changing `
 1. Install with the README one-liner. Confirm Homebrew installs `git` and `gh`.
 2. Confirm setup explains automatic commits and selects nothing by default.
 3. Select a repo in a folder containing only 1 repo. Add another by path. Confirm both appear in the saved config.
-4. Confirm setup reports the running service. Run `repo-sync status`.
+4. Confirm setup reports the running service and daily update policy. Run `repo-sync status`. Both the sync job and the separate updater job should be registered.
 5. Edit a tracked file. Confirm the background service commits and pushes it after the idle interval. Restart the Mac and repeat.
 
 ## Setup failures
@@ -37,7 +39,7 @@ Use a disposable macOS account or VM for Homebrew and launchd checks. Changing `
 - Test working SSH credentials without `gh`. Setup must not require GitHub login.
 - Fail service startup. Setup must report the failure instead of claiming success.
 - Run setup twice. Existing selected repos must remain. Exit or select no repos on a fresh install; no empty service should be installed.
-- Run `setup --no-launch`. Files should be written, with a clear message that the service was not started.
+- Run `setup --no-launch`. Both plists should be written, with a clear message that the service was not started.
 
 ## Upgrade and uninstall
 
@@ -48,6 +50,18 @@ Use a disposable macOS account or VM for Homebrew and launchd checks. Changing `
 5. Repeat with stale `status-<64 lowercase hex digits>.json` cache files, numbered `stdout.log` / `stderr.log` rotations, and `.repo-sync-<digits>` temporary files in config, cache, or LaunchAgents folders. Confirm they are removed. Put `personal.log` in the app's log folder; it must appear under `Preserved`. Check the final `Removed`, `Preserved`, and `Failed` sections.
 6. Make a recorded custom config's parent folder unwritable. Confirm uninstall returns an error, reports the failed path, and retains `install.json` for retry. Restore permissions and rerun. Confirm the old config is removed even after its plist is gone.
 7. Repeat with a Go installation and `--config` pointing to custom settings. Test `--keep-binary` twice: binaries remain, and `install.json` retains only binary paths for later removal.
-8. Test `brew uninstall --cask repo-sync`: the service stops and user files remain. With `--zap`, standard config, logs, cache, and plist move to the trash.
+8. Test `brew uninstall --cask repo-sync`: the service stops and user files remain. The updater job and its schedule must be removed immediately. With `--zap`, standard config, logs, cache, and the remaining plist move to the trash.
 
-The cask keeps cleanup under `zap` because Homebrew also runs uninstall hooks during upgrades. Its pre-uninstall hook stops launchd without deleting the plist and waits up to 45 seconds for the old process to exit. A timeout aborts removal or restart. Post-install reloads only an existing plist and preserves its config path. See the [GoReleaser cask schema](https://goreleaser.com/customization/homebrew_casks/) and [Homebrew Cask Cookbook](https://docs.brew.sh/Cask-Cookbook#stanza-zap).
+The cask keeps cleanup under `zap` because Homebrew also runs uninstall hooks during upgrades. Its pre-uninstall hook preserves the main plist and waits up to 45 seconds for the old daemon to exit. A scoped artifact extension receives Homebrew’s actual upgrade/reinstall flags, preserving the updater during those operations and removing its schedule during a true uninstall. Direct Homebrew uninstall retains the update lock after preflight until its process exits, preventing a competing updater from restarting the daemon during package removal. A timeout aborts removal or restart. Post-install reloads only an existing plist, preserves its config path, switches to the stable Homebrew binary link, and enrolls existing setups into updates without replacing an already registered updater. See the [GoReleaser cask schema](https://goreleaser.com/customization/homebrew_casks/) and [Homebrew Cask Cookbook](https://docs.brew.sh/Cask-Cookbook#stanza-zap).
+
+## Automatic updates
+
+1. Configure an older Homebrew release, then perform the one-time manual upgrade that includes the updater. Confirm `com.vectal-labs.repo-sync.updates` appears in launchd, with the stable Homebrew `bin/repo-sync` path. An unconfigured install must remain unconfigured.
+2. Publish a newer stable release to the test tap. Run `repo-sync update`. Confirm the updater remains registered while Homebrew replaces the binary, the daemon restarts with the expected version, and settings/repositories survive.
+3. Set `repo-sync updates off`, upgrade manually, and rerun setup. Confirm automatic installation remains off and update checks remain registered. Turn it on and confirm the next due check can install.
+4. Simulate a failed download, unavailable tap release, concurrent Homebrew operation, and failed daemon restart. Confirm status shows the actionable failure, repeated errors produce notifications without repeated alerts, and a retry recovers.
+5. Put the Mac to sleep across a scheduled check. The calendar schedule should coalesce missed checks at wake; the engine should honor its stored daily check or retry time.
+6. Hold a sync in progress during upgrade. Confirm Git work finishes before daemon replacement. Run two update commands and attempt `repo-sync uninstall --yes` during updating; competing commands must refuse without stopping the active update.
+7. After successful uninstall, confirm both jobs, plists, update settings/state, lock files, and updater logs are gone. Keep personal files in app directories and confirm they survive.
+
+The optional Homebrew test loads the cask with Homebrew’s own Ruby loader and exercises real artifact forwarding with command execution stubbed. It never registers jobs or installs packages. See [Homebrew’s installer flags](https://github.com/Homebrew/brew/blob/master/Library/Homebrew/cask/installer.rb) and [flight block implementation](https://github.com/Homebrew/brew/blob/master/Library/Homebrew/cask/artifact/abstract_flight_block.rb).

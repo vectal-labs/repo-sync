@@ -120,6 +120,15 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 			return nil
 		}
 	}
+	unlockUpdates, err := acquireUpdateLock()
+	if err != nil {
+		return fail(err)
+	}
+	defer unlockUpdates()
+	updater := updaterService(service)
+	if err := updater.stop(ctx); err != nil {
+		return fail(err)
+	}
 	if err := service.stop(ctx); err != nil {
 		return fail(err)
 	}
@@ -166,6 +175,11 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 			}
 		}
 	}
+	if state, err := updater.inspect(ctx); err != nil {
+		report.failed = append(report.failed, err.Error())
+	} else if state.loaded {
+		report.failed = append(report.failed, "update service is still registered")
+	}
 	// Verify the namespace again, including anything a package hook recreated.
 	if err := scanCleanupArtifacts(home, service, &plan); err != nil {
 		report.failed = append(report.failed, err.Error())
@@ -187,6 +201,18 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 			report.remove(installRecordPath())
 			report.verify([]string{installRecordPath()})
 		}
+	}
+	if len(report.failed) == 0 {
+		// Both jobs and owned processes are stopped before removing lock files.
+		for _, name := range []string{"sync.lock", "update.lock"} {
+			path := filepath.Join(home, "Library", "Caches", "repo-sync", name)
+			if err := safeRemovalPath(home, path); err != nil {
+				report.failed = append(report.failed, err.Error())
+				continue
+			}
+			report.remove(path)
+		}
+		report.removeEmptyDirectory(filepath.Join(home, "Library", "Caches", "repo-sync"))
 	}
 	report.removeEmptyDirectory(filepath.Dir(installRecordPath()))
 	if len(report.failed) > 0 {

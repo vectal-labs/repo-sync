@@ -138,6 +138,8 @@ func TestInstallRecordRejectsReservedConfigPathsAndAliases(t *testing.T) {
 	}
 	for _, path := range []string{
 		installRecordPath(),
+		updateSettingsPath(),
+		updaterService(nil).plistPath(home),
 		filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist"),
 		filepath.Join(home, "Library", "Logs", "repo-sync", "custom.json"),
 		filepath.Join(cache, "custom.json"),

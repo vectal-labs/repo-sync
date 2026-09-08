@@ -35,15 +35,37 @@ func TestServiceInspectRecognizesMissingServiceOnStderr(t *testing.T) {
 }
 
 type lifecycleRunner struct {
-	loaded      bool
-	pid         int
-	failStart   bool
-	failStop    bool
-	failInspect bool
-	starts      int
+	updaterLoaded    bool
+	updaterStarts    int
+	failUpdaterStart bool
+	loaded           bool
+	pid              int
+	failStart        bool
+	failStop         bool
+	failInspect      bool
+	starts           int
 }
 
 func (r *lifecycleRunner) run(_ context.Context, _, _, _ string, args ...string) (string, error) {
+	if strings.HasSuffix(args[len(args)-1], ".updates") || strings.HasSuffix(args[len(args)-1], ".updates.plist") {
+		switch args[0] {
+		case "print":
+			if r.updaterLoaded {
+				return "state = waiting", nil
+			}
+			return "Could not find service " + filepath.Base(args[len(args)-1]), errors.New("not found")
+		case "bootstrap":
+			r.updaterStarts++
+			if r.failUpdaterStart && r.updaterStarts == 1 {
+				return "", errors.New("updater start refused")
+			}
+			r.updaterLoaded = true
+			return "", nil
+		case "bootout":
+			r.updaterLoaded = false
+			return "", nil
+		}
+	}
 	switch args[0] {
 	case "print":
 		if r.failInspect {

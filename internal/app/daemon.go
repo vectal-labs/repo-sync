@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsevents"
@@ -75,6 +76,7 @@ type daemon struct {
 	alerts *failureAlerts
 
 	statusFile     string
+	updateGate     string
 	healthInterval time.Duration
 	inflight       sync.WaitGroup
 }
@@ -110,6 +112,7 @@ func runDaemon(ctx context.Context, configPath string) error {
 	runner.warn = logger.Printf
 	d := newDaemon(ctx, cfg, runner, logger)
 	d.statusFile = statusPath(configPath)
+	d.updateGate = updateGatePath()
 	return d.run()
 }
 
@@ -314,6 +317,22 @@ func (s *repoState) resumeNow(callback func()) {
 }
 
 func (d *daemon) syncRepo(state *repoState, commitLocal bool) {
+	if d.ctx.Err() != nil {
+		return
+	}
+	if d.updateGate != "" {
+		unlock, err := lockUpdateFile(d.updateGate, syscall.LOCK_SH)
+		if err != nil {
+			if errors.Is(err, errUpdateBusy) {
+				state.scheduleIfAbsent(time.Second, func() { d.syncRepo(state, commitLocal) })
+			} else if ok, _ := state.beginSync(d.now()); ok {
+				next := d.handleResult(state, syncReport{}, fmt.Errorf("cannot coordinate with updater: %w", err))
+				state.endSync(next, func() { d.syncRepo(state, commitLocal) })
+			}
+			return
+		}
+		defer unlock()
+	}
 	missing := repoMissing(state.config.Path)
 	if !commitLocal && !missing {
 		if !state.isAvailable(d.now()) {
