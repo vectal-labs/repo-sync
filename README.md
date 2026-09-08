@@ -4,7 +4,7 @@ Your Git repos, always in sync.
 
 You edit. After 60 seconds of quiet, repo-sync commits, pulls, and pushes. It starts at login and runs in the background.
 
-For notes, docs, config, and small team repos. macOS only.
+For shared team repos containing documents, finance, legal, skills, and team context. Not intended for complex software development projects. macOS only.
 
 ## Install
 

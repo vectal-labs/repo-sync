@@ -91,6 +91,7 @@ func runSetup(ctx context.Context, opts setupOptions) error {
 		return fmt.Errorf("read existing config: %w", err)
 	}
 	fmt.Fprintln(opts.out, "\n2/4 Choose repositories")
+	fmt.Fprintln(opts.out, "Choose shared team document and context repos. Complex software development projects are outside repo-sync's intended scope.")
 	fmt.Fprintf(opts.out, "After %s without edits, repo-sync commits, pulls, and pushes on each repo's default branch.\n", cfg.IdleDebounce)
 	fmt.Fprintln(opts.out, "This includes staged changes. Secret filenames are blocked; file contents are not scanned.")
 	fmt.Fprintf(opts.out, "Scanning %s...\n", home)

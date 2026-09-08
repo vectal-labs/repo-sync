@@ -1,5 +1,7 @@
 # how repo-sync behaves
 
+repo-sync is for shared team documents and context where edits should be committed and shared automatically on the default branch. It does not manage pull requests or code review workflows.
+
 ## setup
 
 - setup explains automatic commits, finds repositories (including folders with just 1 repo), and lets you select repos or enter a path. nothing is preselected. rerunning setup keeps existing repositories.

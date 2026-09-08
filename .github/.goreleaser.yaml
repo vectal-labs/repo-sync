@@ -27,7 +27,7 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     directory: Casks
     homepage: https://github.com/vectal-labs/repo-sync
-    description: Keeps your Git repositories in sync automatically on macOS
+    description: Automatically syncs shared team docs and context through Git on macOS
     license: MIT
     binaries: [repo-sync]
     dependencies:
