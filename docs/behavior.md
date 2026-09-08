@@ -26,6 +26,15 @@ repo-sync is for shared team documents and context where edits should be committ
 - existing users must manually upgrade once to receive the updater. that upgrade enrolls an already configured service. an unconfigured Homebrew install creates no background jobs until setup.
 - after an upgrade, run `repo-sync status` to check readiness. for a Go installation, install the new binary and rerun `repo-sync setup`.
 
+## stop syncing one repository
+
+- `repo-sync remove [path]` removes a repository from this Mac's config. Without a path, it uses the current repository. A missing folder can be removed using its configured path.
+- it stops the matching background service gracefully, saves the removal, restarts the service, and verifies readiness. a Git operation already in progress may finish during shutdown. files and Git history are preserved; previous pushes remain on the remote.
+- remaining repositories continue syncing after the restart. removing the last repository leaves a healthy service with no repositories.
+- use `repo-sync remove --config /path/to/config.json /path/to/repo` for a custom config. if a loaded service uses another config, removal stops with an error before changing settings.
+- if restarting or readiness fails, the command returns an error and keeps the removal saved. if no background service is running, it only removes the registration; any foreground `repo-sync run` processes need restarting separately.
+- the [agent skill](agent-skill.md) includes an operational guide and legacy removal instructions.
+
 ## uninstall
 
 - `repo-sync uninstall` previews this user's recorded and standard install locations, including `PATH`, Go, and Homebrew locations. it finds verified repo-sync copies there; it does not search the whole disk. Homebrew installations are removed through Homebrew.

@@ -15,6 +15,7 @@ const usage = `usage: repo-sync <command> [options]
 
   setup                 find repositories, choose which to sync, install the service
   add [path]            start syncing a repository (defaults to the current one)
+  remove [path]         stop syncing a repository; keep its files and Git history
   allow <path>          let a secret-guarded file in the current repository sync
   status                show service readiness and repository health
   version               show the installed version
@@ -134,6 +135,14 @@ func Run(args []string) error {
 			return fmt.Errorf("usage: repo-sync add [--config path] [repo path]")
 		}
 		return runAdd(*configPath, flags.Arg(0), os.Stdout)
+	case "remove":
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() > 1 {
+			return fmt.Errorf("usage: repo-sync remove [--config path] [repo path]")
+		}
+		return runRemove(context.Background(), *configPath, flags.Arg(0), defaultService(), os.Stdout)
 	case "allow":
 		repoFlag := flags.String("repo", "", "repository path (defaults to the current repository)")
 		if err := flags.Parse(args); err != nil {
@@ -186,6 +195,11 @@ func runAdd(configPath, path string, out *os.File) error {
 	}}, os.Stdin, out); err != nil {
 		return err
 	}
+	unlock, err := acquireUpdateLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	store := &configStore{path: configPath}
 	var added repoConfig
 	err = store.update(func(cfg *config) error {
@@ -213,6 +227,11 @@ func runAllow(configPath, repoPath, file string, out *os.File) error {
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return fmt.Errorf("%s is not inside %s", abs, root)
 	}
+	unlock, err := acquireUpdateLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	store := &configStore{path: configPath}
 	if err := store.update(func(cfg *config) error { return allowPath(cfg, root, rel) }); err != nil {
 		return err

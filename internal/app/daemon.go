@@ -121,11 +121,6 @@ func (d *daemon) run() error {
 	defer cancelOps()
 	d.opCtx = opCtx
 
-	if len(d.states) == 0 {
-		d.logger.Print("no repositories configured; run `repo-sync setup` or `repo-sync add`")
-		<-d.ctx.Done()
-		return nil
-	}
 	paths := make([]string, 0, len(d.states))
 	for _, state := range d.states {
 		// A folder that is not there is a failure of that one repository, never
@@ -166,6 +161,11 @@ func (d *daemon) run() error {
 			_ = os.Remove(d.statusFile)
 		}
 	}()
+	if len(d.states) == 0 {
+		d.logger.Print("no repositories configured; run `repo-sync setup` or `repo-sync add`")
+		<-d.ctx.Done()
+		return nil
+	}
 
 	go d.periodicRemoteSync()
 	go d.healthLoop()
