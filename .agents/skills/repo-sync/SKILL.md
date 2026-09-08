@@ -1,6 +1,6 @@
 ---
 name: repo-sync
-description: Manage repo-sync on macOS for shared documents and team context. Use when asked what repo-sync does, to automatically sync a repo, add a repo to repo-sync, stop syncing or un-sync a repo, check sync health, configure repo-sync, uninstall it, or install and maintain its bundled agent skill. Ordinary one-time Git pulls and pushes do not need this skill.
+description: Manage repo-sync on macOS for shared documents and team context. Use when asked what repo-sync does, to automatically sync a repo, add a repo to repo-sync, stop syncing or un-sync a repo, check sync health, inspect or repair repo-sync conflicts, configure repo-sync, uninstall it, or install and maintain its bundled agent skill. Ordinary one-time Git pulls and pushes do not need this skill.
 ---
 
 # repo-sync
@@ -20,11 +20,26 @@ command -v repo-sync
 repo-sync help
 ```
 
-Use the installed help as the command contract. Older binaries may lack `skill`, `remove`, `status`, or `version`. Run `repo-sync version` when listed. Installing this skill does not install or upgrade the binary.
+Use the installed help as the command contract. Older binaries may lack `conflicts`, `skill`, `remove`, `status`, or `version`. Run `repo-sync version` when listed. Installing this skill does not install or upgrade the binary.
 
 The default config is `~/Library/Application Support/repo-sync/config.json`. Check the installed service's `ProgramArguments` in `~/Library/LaunchAgents/com.vectal-labs.repo-sync.plist` for a custom path. Use that config throughout. Put flags before positional arguments.
 
 Read [references/operations.md](references/operations.md) for custom settings, unsupported commands, legacy removal, upgrades, or failed checks.
+
+## Inspect or repair conflicts
+
+When installed help lists `conflicts`:
+
+```sh
+repo-sync conflicts
+repo-sync conflicts --config "/absolute/path/to/config.json" "/absolute/path/to/notes"
+```
+
+Without a path, this lists saved conflicts across the selected config. A path selects one configured repo, even if its folder is missing. The command does not change Git; it creates a private report outside synced folders with affected files, saved versions, and repair steps.
+
+Conflicts notify immediately once per incident. `repo-sync status` keeps showing `conflict` across retries and restarts until a full sync succeeds. Other repos continue syncing.
+
+Before repairing, read **Repair a conflict** in [references/operations.md](references/operations.md). Inspect fresh Git state and use the existing task's authorization. A request to inspect does not authorize a repair. The automatic rebase was aborted, so do not blindly run `git rebase --continue` or copy saved versions over current files.
 
 ## Start syncing
 
@@ -94,7 +109,7 @@ Use `repo-sync uninstall` only when the user requests uninstalling repo-sync. It
 
 - Secrets are blocked by filename, including `.env`, private keys, and `.npmrc`. Contents are not scanned; ordinary filenames can still contain secrets. Blocked staged files can be unstaged by normal syncing.
 - Use `repo-sync allow` only when publishing that file is explicitly authorized.
-- Conflicts keep local commits, abort repo-sync's own rebase, and retry. There is no automatic conflict resolution or force-push. One failing repo does not block the others.
+- Conflicts keep local commits, abort repo-sync's own rebase, and retry. Manual Git operations are left alone. There is no automatic conflict resolution or force-push. One failing repo does not block the others.
 - Do not reset history, switch branches, delete lock files, or override secret protection just to clear an error.
 - There is no `pause`, `resume`, or `sync now` command. Check help before using any command.
 - Check exit codes and fresh status. A running service can still have repo failures. Do not create verification commits or push test files into the user's repos without authorization.

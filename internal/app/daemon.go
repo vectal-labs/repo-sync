@@ -47,19 +47,21 @@ type repoState struct {
 	timer        *time.Timer
 	lastOwnWrite time.Time
 
-	// Retry and incident tracking. Nothing here is ever persisted.
-	failures       int
-	nextAttempt    time.Time
-	incident       string // non-empty while a failure incident is open
-	incidentSince  time.Time
-	incidentNoted  bool // the open incident has already produced a popup
-	lastSuccess    time.Time
-	unavailable    bool   // the last attempt found the folder missing
-	lastSkip       string // last skip reason logged, to avoid repeating it
-	offBranchSince time.Time
-	offBranchNoted bool
-	secretsNoted   map[string]bool
-	withheldNoted  map[string]bool // secret paths in unpublished commits already reported
+	// Transient retry tracking; conflict records below are persisted separately.
+	failures          int
+	nextAttempt       time.Time
+	incident          string // non-empty while a failure incident is open
+	incidentSince     time.Time
+	incidentNoted     bool // the open incident has already produced a popup
+	lastSuccess       time.Time
+	unavailable       bool   // the last attempt found the folder missing
+	lastSkip          string // last skip reason logged, to avoid repeating it
+	offBranchSince    time.Time
+	offBranchNoted    bool
+	secretsNoted      map[string]bool
+	withheldNoted     map[string]bool   // secret paths in unpublished commits already reported
+	conflict          *conflictIncident // persisted separately from transient failures
+	conflictLoadError string
 }
 
 type daemon struct {
@@ -75,6 +77,8 @@ type daemon struct {
 	online func(context.Context) bool
 	alerts *failureAlerts
 
+	configPath     string
+	conflictDir    string
 	statusFile     string
 	updateGate     string
 	healthInterval time.Duration
@@ -83,7 +87,7 @@ type daemon struct {
 
 func newDaemon(ctx context.Context, cfg config, runner commandRunner, logger *log.Logger) *daemon {
 	d := &daemon{
-		ctx: ctx, opCtx: context.Background(), cfg: cfg,
+		ctx: ctx, opCtx: context.Background(), cfg: cfg, configPath: defaultConfigPath(),
 		syncer: gitSyncer{runner: runner},
 		states: make(map[string]*repoState),
 		logger: logger,
@@ -112,11 +116,14 @@ func runDaemon(ctx context.Context, configPath string) error {
 	runner.warn = logger.Printf
 	d := newDaemon(ctx, cfg, runner, logger)
 	d.statusFile = statusPath(configPath)
+	d.configPath = configPath
+	d.conflictDir = conflictsPath(configPath)
 	d.updateGate = updateGatePath()
 	return d.run()
 }
 
 func (d *daemon) run() error {
+	d.loadConflicts()
 	opCtx, cancelOps := context.WithCancel(context.Background())
 	defer cancelOps()
 	d.opCtx = opCtx
@@ -386,6 +393,21 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) ti
 	name := state.config.Name
 	if err == nil {
 		state.mu.Lock()
+		hasConflict := state.conflict != nil || state.conflictLoadError != ""
+		state.mu.Unlock()
+		if hasConflict {
+			// A remote-only cycle can return early after noticing new edits.
+			if !report.Checked {
+				return 0
+			}
+			if clearErr := d.clearConflict(state); clearErr != nil {
+				return d.handleResult(state, report, fmt.Errorf("clear saved conflict: %w", clearErr))
+			}
+		}
+		state.mu.Lock()
+		if report.Checked {
+			state.conflictLoadError = ""
+		}
 		recovered := state.incident != ""
 		state.failures, state.incident, state.nextAttempt = 0, "", time.Time{}
 		state.incidentSince, state.incidentNoted, state.unavailable = time.Time{}, false, false
@@ -399,6 +421,12 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) ti
 		if summary := report.String(); summary != "" {
 			d.logger.Printf("%s: %s", name, summary)
 		}
+		return 0
+	}
+
+	var conflict *conflictError
+	if errors.As(err, &conflict) {
+		d.noteConflict(state, conflict)
 		return 0
 	}
 

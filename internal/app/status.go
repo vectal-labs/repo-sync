@@ -46,6 +46,10 @@ func (d *daemon) statusSnapshot() serviceStatus {
 		state.mu.Lock()
 		repo := repositoryStatus{Name: state.config.Name, State: "waiting", LastSuccess: state.lastSuccess}
 		switch {
+		case state.conflict != nil:
+			repo.State, repo.Detail = "conflict", conflictDetail(state.conflict)
+		case state.conflictLoadError != "":
+			repo.State, repo.Detail = "retrying", state.conflictLoadError
 		case state.syncing:
 			repo.State = "syncing"
 		case state.incident != "":
@@ -151,7 +155,10 @@ func runStatus(ctx context.Context, configPath string, service *launchService, o
 			fmt.Fprintf(out, "; last successful cycle %s", repo.LastSuccess.Local().Format("2006-01-02 15:04:05"))
 		}
 		fmt.Fprintln(out)
-		if repo.State == "retrying" {
+		if repo.State == "conflict" {
+			fmt.Fprintf(out, "    Run `%s` for repair instructions.\n", configCommand("conflicts", configPath))
+		}
+		if repo.State == "retrying" || repo.State == "conflict" {
 			unhealthy = true
 		}
 	}

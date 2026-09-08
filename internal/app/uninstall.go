@@ -169,7 +169,7 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 		report.remove(path)
 	}
 	report.verify(plan.files)
-	for _, dir := range appDirectories(home)[1:] {
+	for _, dir := range append(append([]string{}, plan.emptyDirs...), appDirectories(home)[1:]...) {
 		report.removeEmptyDirectory(dir)
 	}
 	if state, err := service.inspect(ctx); err != nil {
@@ -202,7 +202,7 @@ func runUninstall(ctx context.Context, opts uninstallOptions) error {
 	}
 	report.preserved = append(report.preserved, plan.preserved...)
 	report.verify(plan.files)
-	for _, dir := range appDirectories(home)[1:] {
+	for _, dir := range append(append([]string{}, plan.emptyDirs...), appDirectories(home)[1:]...) {
 		report.removeEmptyDirectory(dir)
 	}
 	if len(report.failed) == 0 {

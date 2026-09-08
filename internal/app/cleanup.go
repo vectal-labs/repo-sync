@@ -21,6 +21,7 @@ func isRepoSyncBinary(path string) bool {
 }
 
 type cleanupPlan struct {
+	emptyDirs   []string
 	files       []string
 	binaries    []binaryRemoval
 	executables []string
@@ -31,9 +32,11 @@ type cleanupPlan struct {
 type cleanupReport struct{ removed, preserved, failed []string }
 
 var (
-	ownedTemporary = regexp.MustCompile(`^\.repo-sync-[0-9]+$`)
-	ownedLog       = regexp.MustCompile(`^(updates-)?(stdout|stderr)\.log(\.[0-9]+(\.gz)?)?$`)
-	ownedStatus    = regexp.MustCompile(`^(status|updates)-[a-f0-9]{64}\.json$`)
+	ownedTemporary    = regexp.MustCompile(`^\.repo-sync-[0-9]+$`)
+	ownedLog          = regexp.MustCompile(`^(updates-)?(stdout|stderr)\.log(\.[0-9]+(\.gz)?)?$`)
+	ownedConflictDir  = regexp.MustCompile(`^status-[a-f0-9]{64}-conflicts$`)
+	ownedConflictFile = regexp.MustCompile(`^[a-f0-9]{64}\.(json|md)$`)
+	ownedStatus       = regexp.MustCompile(`^(status|updates)-[a-f0-9]{64}\.json$`)
 )
 
 func appDirectories(home string) []string {
@@ -264,6 +267,15 @@ func scanCleanupDirectory(home, dir string, reportUnknown bool, matches func(str
 	for _, entry := range entries {
 		path := filepath.Join(dir, entry.Name())
 		if path == installRecordPath() || path == skillRecordPath() || path == skillLockPath() || path == filepath.Join(updateCacheDir(), "update.lock") || path == updateGatePath() || containsPath(plan.files, path) {
+			continue
+		}
+		if dir == filepath.Join(home, "Library", "Caches", "repo-sync") && entry.IsDir() && ownedConflictDir.MatchString(entry.Name()) {
+			if err := scanCleanupDirectory(home, path, true, func(name string) bool { return ownedConflictFile.MatchString(name) || ownedTemporary.MatchString(name) }, plan); err != nil {
+				return err
+			}
+			if !containsPath(plan.emptyDirs, path) {
+				plan.emptyDirs = append(plan.emptyDirs, path)
+			}
 			continue
 		}
 		if matches(entry.Name()) && !entry.IsDir() {

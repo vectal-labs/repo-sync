@@ -90,7 +90,7 @@ func TestGitSyncSkipsDetachedHead(t *testing.T) {
 	}
 }
 
-func TestGitSyncAbortsRebaseConflictAndSkips(t *testing.T) {
+func TestGitSyncAbortsRebaseConflictAndReports(t *testing.T) {
 	t.Parallel()
 	remote, local := makeGitFixture(t)
 	other := filepath.Join(t.TempDir(), "other")
@@ -104,9 +104,12 @@ func TestGitSyncAbortsRebaseConflictAndSkips(t *testing.T) {
 	remoteHead := strings.TrimSpace(gitOutput(t, other, "rev-parse", "HEAD"))
 
 	_, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, false)
-	var skip *skipError
-	if !errors.As(err, &skip) || !strings.Contains(skip.reason, "rebase aborted") {
-		t.Fatalf("error = %v, want conflict skip", err)
+	var conflict *conflictError
+	if !errors.As(err, &conflict) || !strings.Contains(conflict.Error(), "rebase aborted") {
+		t.Fatalf("error = %v, want an actionable conflict", err)
+	}
+	if len(conflict.Files) != 1 || conflict.Files[0].Path != "shared.txt" || string(conflict.Files[0].Local.Data) != "local\n" || string(conflict.Files[0].Upstream.Data) != "remote\n" {
+		t.Fatalf("wrong conflict snapshots: %+v", conflict.Files)
 	}
 	if got := strings.TrimSpace(gitOutput(t, local, "rev-parse", "HEAD")); got != localHead {
 		t.Fatalf("HEAD after abort = %s, want %s", got, localHead)
@@ -1313,8 +1316,9 @@ func TestGitSyncRefusesRebaseOverRetainedIgnoredFile(t *testing.T) {
 			}
 			report, err = syncer.sync(context.Background(), repo, true)
 			if test.remote == test.file {
-				if !errors.As(err, &skip) || !strings.Contains(skip.reason, "rebase aborted") {
-					t.Fatalf("error = %v, want conflict skip", err)
+				var conflict *conflictError
+				if !errors.As(err, &conflict) || !strings.Contains(conflict.Error(), "rebase aborted") {
+					t.Fatalf("error = %v, want an actionable conflict", err)
 				}
 				return
 			}

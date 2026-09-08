@@ -328,8 +328,24 @@ func (s gitSyncer) rebase(ctx context.Context, c *checkout, remoteRef string) er
 		return nil
 	}
 	if s.rebaseInProgress(ctx, c.path) {
-		_, _ = c.git(ctx, "", "rebase", "--abort")
-		return &skipError{reason: "rebase conflict with " + remoteRef + "; rebase aborted, will retry"}
+		conflict, captureErr := s.captureConflict(ctx, c, remoteRef)
+		_, abortErr := c.git(ctx, "", "rebase", "--abort")
+		if abortErr == nil && s.rebaseInProgress(ctx, c.path) {
+			abortErr = errors.New("rebase is still in progress")
+		}
+		if abortErr != nil {
+			// Keep the unresolved index available to the user's Git commands.
+			abortErr = errors.Join(abortErr, c.install())
+		}
+		if captureErr != nil || conflict == nil {
+			return errors.Join(err, captureErr, abortErr)
+		}
+		if abortErr != nil {
+			conflict.AbortError = redactCredentials(abortErr.Error())
+		}
+		// Read immutable blobs only after the working tree has been restored.
+		s.captureConflictContents(ctx, c.path, conflict)
+		return conflict
 	}
 	// A file changed between our clean check and the rebase. Nothing is
 	// broken; the next cycle simply commits it first.

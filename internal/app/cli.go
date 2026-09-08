@@ -19,6 +19,7 @@ const usage = `usage: repo-sync <command> [options]
   remove [path]         stop syncing a repository; keep its files and Git history
   allow <path>          let a secret-guarded file in the current repository sync
   status                show service readiness and repository health
+  conflicts [path]      show saved conflicts and a local repair guide
   skill <command>       install, refresh, inspect, or remove the bundled agent skill
   version               show the installed version
   update                check and install the latest Homebrew release now
@@ -124,6 +125,14 @@ func Run(args []string, bundle fs.FS) error {
 			return fmt.Errorf("usage: repo-sync status [--config path]")
 		}
 		return runStatus(context.Background(), *configPath, defaultService(), os.Stdout)
+	case "conflicts":
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		if flags.NArg() > 1 {
+			return fmt.Errorf("usage: repo-sync conflicts [--config path] [repo path]")
+		}
+		return runConflicts(context.Background(), *configPath, flags.Arg(0), os.Stdout)
 	case "uninstall":
 		yes := flags.Bool("yes", false, "remove without a confirmation prompt")
 		keepBinary := flags.Bool("keep-binary", false, "remove service and data, but keep the installed program")

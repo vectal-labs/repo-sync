@@ -1,5 +1,14 @@
 # Operations and troubleshooting
 
+## Contents
+
+- [Inspect service and configuration](#inspect-service-and-configuration)
+- [Repair a conflict](#repair-a-conflict)
+- [Legacy removal](#legacy-removal)
+- [Common failures](#common-failures)
+- [Updates and unsupported commands](#updates-and-unsupported-commands)
+- [Agent skill installation](#agent-skill-installation)
+
 ## Inspect service and configuration
 
 ```sh
@@ -20,6 +29,36 @@ The config contains:
 - `repositories`: entries with unique `name`, absolute `path`, `remote`, and optional `allow` patterns.
 
 For authorized setting changes, resolve config symlinks, preserve unrelated fields, and write atomically. Recheck the original contents immediately before writing; do not overwrite concurrent edits. The daemon reads settings at startup. Apply changes with `repo-sync setup --config "/absolute/path/to/config.json"`, then verify status with that config. For removing repos, prefer `remove` and use the legacy procedure below only when unavailable.
+
+## Repair a conflict
+
+Check installed help for `conflicts` first. An older binary may only log conflicts. Do not invent an unavailable command; report the limitation and use the installed version's supported workflow.
+
+```sh
+repo-sync conflicts --config "/absolute/path/to/config.json" "/absolute/path/to/notes"
+```
+
+Omit `--config` for the default config. Omit the repo path to list all saved conflicts in that config. For a missing folder, use its configured path to inspect the saved incident; restore or locate the clone before repairing.
+
+The command reads saved conflict state without changing Git. It writes a private report in repo-sync's cache, outside synced folders. The report includes affected paths, snapshot time, commit IDs, base version, upstream side, and local commit being replayed. During a rebase, the upstream side can include earlier replayed local commits. These are conflict-time snapshots, not necessarily the latest branch tips.
+
+Binary, oversized, missing, or submodule versions have explicit notes. Follow those notes and inspect Git objects or the relevant submodule when needed. Never treat an unavailable snapshot as an empty file, choose a winner automatically, or upload reports or private file contents to a remote service.
+
+Use existing task authorization for the repair. Inspection alone does not authorize edits. Once authorized:
+
+1. Read fresh `git status`, the current branch, configured remote, and default branch. If another merge, rebase, cherry-pick, revert, or bisect is active, leave it alone unless the task authorizes completing that operation. repo-sync also steps back while it is active.
+2. Start from a clean worktree on the configured default branch. Preserve uncommitted work and inspect any branch mismatch before proceeding. Do not reset history, switch branches, or discard changes just to satisfy this step.
+3. Fetch the configured remote, then start a fresh rebase onto its default branch. repo-sync already aborted its failed automatic rebase. For a verified `origin` remote and `main` default branch:
+
+   ```sh
+   git fetch origin
+   git rebase origin/main
+   ```
+
+4. Resolve the fresh conflict in the editor using both sides and the base. Use the saved report as context only. Stage each intended resolution with `git --literal-pathspecs add -- "relative/path"` or `git --literal-pathspecs rm -- "relative/path"` for an intended deletion. Run `git rebase --continue`; repeat if later commits conflict. Do not use `--skip` to discard a commit. To cancel only the manual rebase you started, use `git rebase --abort`.
+5. Check the resulting files and `git status`. Let repo-sync finish its normal sync, then verify fresh `repo-sync status` with the same config. A successful rebase alone does not prove the push succeeded. Report any remaining conflict or sync failure.
+
+There is no pause or resume command. Automatic retries continue, and active manual Git operations are left alone. macOS sends one conflict notification per incident across ordinary retries and restarts. Notification settings can hide the banner; status keeps the incident visible until a verified full sync succeeds.
 
 ## Legacy removal
 
@@ -57,7 +96,7 @@ If restart or verification fails, report that the removal was saved and remainin
 
 - **Identity or authentication:** follow the named CLI failure. Use existing identity and credentials. Setup checks fetch and dry-run push access; real server hooks or branch protection can still reject a later push.
 - **Feature branch or detached HEAD:** report the skipped branch. Do not switch branches automatically.
-- **Conflict:** repo-sync keeps local commits and aborts its own failed rebase. Resolve the conflict only when authorized.
+- **Conflict:** inspect `repo-sync conflicts` when available, then follow **Repair a conflict** above. The notification is immediate; status remains `conflict` until a full sync succeeds.
 - **Missing folder:** the registration stays; other repos continue. Returning the folder triggers recovery. Remove its registration when the user wants permanent un-syncing.
 - **Offline:** automatic retries continue without offline notifications.
 - **Other failures:** retries start at 1 minute and double up to 30 minutes. Persistent failures notify after 10 minutes.

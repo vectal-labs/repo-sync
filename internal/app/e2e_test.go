@@ -127,8 +127,8 @@ func TestEndToEndTwoClonesStayInSync(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(messages) != 1 {
-		t.Fatalf("expected exactly one notification (the secret), got %q", messages)
+	if len(messages) != 2 || !strings.Contains(messages[0], ".env") || !strings.Contains(messages[1], "Conflict in ") {
+		t.Fatalf("expected one secret notification and one conflict notification, got %q", messages)
 	}
 }
 
