@@ -58,6 +58,8 @@ type repoState struct {
 	lastSkip          string // last skip reason logged, to avoid repeating it
 	offBranchSince    time.Time
 	offBranchNoted    bool
+	stuck             bool // the last skip will not clear without the user
+	stuckNoted        bool
 	secretsNoted      map[string]bool
 	withheldNoted     map[string]bool   // secret paths in unpublished commits already reported
 	conflict          *conflictIncident // persisted separately from transient failures
@@ -414,6 +416,7 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) ti
 		state.lastSkip = ""
 		state.lastSuccess = d.now()
 		state.offBranchSince, state.offBranchNoted = time.Time{}, false
+		state.stuck, state.stuckNoted = false, false
 		state.mu.Unlock()
 		if recovered {
 			d.logger.Printf("%s recovered", name)
@@ -435,9 +438,15 @@ func (d *daemon) handleResult(state *repoState, report syncReport, err error) ti
 		state.mu.Lock()
 		repeat := state.lastSkip == skip.reason
 		state.lastSkip = skip.reason
+		state.stuck = skip.stuck
+		notifyStuck := skip.stuck && !state.stuckNoted
+		state.stuckNoted = skip.stuck
 		state.mu.Unlock()
 		if !repeat {
 			d.logger.Printf("%s skipped: %s", name, skip.reason)
+		}
+		if notifyStuck {
+			d.sendNotification(fmt.Sprintf("%s is stuck: %s", name, skip.reason))
 		}
 		if skip.offBranch {
 			d.noteOffBranch(state, skip.reason)

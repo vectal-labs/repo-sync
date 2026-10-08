@@ -54,6 +54,8 @@ func (d *daemon) statusSnapshot() serviceStatus {
 			repo.State = "syncing"
 		case state.incident != "":
 			repo.State, repo.Detail = "retrying", redactCredentials(state.incident)
+		case state.stuck:
+			repo.State, repo.Detail = "stuck", state.lastSkip
 		case state.lastSkip != "":
 			repo.State, repo.Detail = "waiting", state.lastSkip
 		case !state.lastSuccess.IsZero():
@@ -158,7 +160,7 @@ func runStatus(ctx context.Context, configPath string, service *launchService, o
 		if repo.State == "conflict" {
 			fmt.Fprintf(out, "    Run `%s` for repair instructions.\n", configCommand("conflicts", configPath))
 		}
-		if repo.State == "retrying" || repo.State == "conflict" {
+		if repo.State == "retrying" || repo.State == "conflict" || repo.State == "stuck" {
 			unhealthy = true
 		}
 	}

@@ -7,7 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// A crashed Git command can leave index.lock behind forever. Real Git work
+// never holds it this long, so an older lock is reported as stuck. It is
+// never deleted automatically.
+const staleLockAfter = time.Hour
 
 // checkout is repo-sync's ownership of a working tree for one operation.
 //
@@ -34,6 +40,13 @@ type checkout struct {
 	done   bool
 }
 
+func lockSkip(lock string, now time.Time) *skipError {
+	if info, err := os.Stat(lock); err == nil && now.Sub(info.ModTime()) >= staleLockAfter {
+		return &skipError{reason: fmt.Sprintf("Git's index.lock has existed since %s; if no Git command is running, delete %s", info.ModTime().Local().Format("2006-01-02 15:04"), lock), stuck: true}
+	}
+	return &skipError{reason: "another git process is using the checkout (index.lock exists); will retry"}
+}
+
 // lockCheckout takes the lock and then verifies, now that nothing can change,
 // that no Git operation is in progress and HEAD is the default branch.
 func (s gitSyncer) lockCheckout(ctx context.Context, repo repoConfig, branch string) (*checkout, error) {
@@ -53,7 +66,7 @@ func (s gitSyncer) lockCheckout(ctx context.Context, repo repoConfig, branch str
 	file, err := os.OpenFile(c.lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return nil, &skipError{reason: "another git process is using the checkout (index.lock exists); will retry"}
+			return nil, lockSkip(c.lock, time.Now())
 		}
 		return nil, err
 	}

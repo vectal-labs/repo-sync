@@ -272,6 +272,28 @@ func TestOffBranchNotifiesOnceAfterThreshold(t *testing.T) {
 	}
 }
 
+func TestStuckSkipNotifiesOnceAndShowsInStatus(t *testing.T) {
+	td := newTestDaemon(t, "notes")
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{}, &skipError{reason: "Git's index.lock has existed since 2026-09-17 04:05", stuck: true}
+	}
+	state := td.states["notes"]
+	td.syncRepo(state, true)
+	td.syncRepo(state, true)
+	if got := td.notifications(); len(got) != 1 || !strings.Contains(got[0], "notes is stuck") {
+		t.Fatalf("notifications = %q, want exactly one", got)
+	}
+	if repo := td.statusSnapshot().Repositories[0]; repo.State != "stuck" || !strings.Contains(repo.Detail, "index.lock") {
+		t.Fatalf("status = %+v, want stuck", repo)
+	}
+
+	td.syncer.results["notes"] = nil
+	td.syncRepo(state, true)
+	if repo := td.statusSnapshot().Repositories[0]; repo.State == "stuck" {
+		t.Fatalf("a successful sync did not clear the stuck state: %+v", repo)
+	}
+}
+
 func TestSecretFilesNotifyOncePerIncident(t *testing.T) {
 	td := newTestDaemon(t, "notes")
 	blocked := []string{".env"}

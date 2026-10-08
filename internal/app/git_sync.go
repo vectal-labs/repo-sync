@@ -17,6 +17,7 @@ import (
 type skipError struct {
 	reason    string
 	offBranch bool // checkout is not on the remote default branch
+	stuck     bool // will not clear without the user, such as a stale index.lock
 }
 
 func (e *skipError) Error() string { return e.reason }

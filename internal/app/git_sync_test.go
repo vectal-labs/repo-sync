@@ -1577,6 +1577,28 @@ func TestGitSyncSkipsWhileAnotherGitProcessHoldsTheIndex(t *testing.T) {
 	}
 }
 
+// A lock left by a crashed Git command is reported as stuck, never deleted.
+func TestGitSyncReportsStaleIndexLockAsStuck(t *testing.T) {
+	_, local := makeGitFixture(t)
+	write(t, local, "mine.txt", "mine\n")
+	lock := filepath.Join(local, ".git", "index.lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-staleLockAfter - time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	_, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+	var skip *skipError
+	if !errors.As(err, &skip) || !skip.stuck || !strings.Contains(skip.reason, lock) {
+		t.Fatalf("err = %v; want a stuck skip naming %s", err, lock)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("a stale lock must not be removed automatically: %v", err)
+	}
+}
+
 // A local branch named "origin/main" must never be mistaken for the remote.
 func TestGitSyncUsesFullRemoteRefName(t *testing.T) {
 	remote, local := makeGitFixture(t)

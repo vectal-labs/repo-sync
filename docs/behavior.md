@@ -65,7 +65,7 @@ repo-sync is for shared team documents and context where edits should be committ
 - `git checkout -b` at the current commit is the one switch git allows without that lock. if it slips in, repo-sync undoes what it just did on the new branch and skips the cycle. main and the new branch end up exactly where they were.
 - hooks run as usual and inherit the daemon's index, so a hook could switch branches mid-rebase. repo-sync uses HEAD's reflog to distinguish switches during the rebase from switches after it finishes. a switch during the rebase restores main and stops the push; a switch after it finishes leaves the other branch's work alone and skips the rest of the cycle. repositories without reflogs fall back to comparing commit metadata.
 - the daemon never aborts a rebase it did not start. someone else's rebase, merge, or cherry-pick in progress makes it step back.
-- if the daemon is killed hard while holding the lock, `index.lock` stays behind, exactly as after any crashed git command. remove it by hand.
+- if the daemon is killed hard while holding the lock, `index.lock` stays behind, exactly as after any crashed git command. remove it by hand. a lock older than one hour is shown as `stuck` in `repo-sync status` with one notification; repo-sync never deletes it.
 - if a repo stays off its default branch for 24 hours you get one notification. no nagging.
 - during a merge, rebase, cherry-pick, revert, or bisect it steps back until you are done.
 
