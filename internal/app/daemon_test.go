@@ -294,6 +294,22 @@ func TestStuckSkipNotifiesOnceAndShowsInStatus(t *testing.T) {
 	}
 }
 
+// An older retryable failure must not hide a lock that needs the user.
+func TestStuckSkipOutranksEarlierFailureInStatus(t *testing.T) {
+	td := newTestDaemon(t, "notes")
+	state := td.states["notes"]
+	td.syncer.results["notes"] = func() (syncReport, error) { return syncReport{}, errors.New("git timed out") }
+	td.syncRepo(state, true)
+	td.advance(maxBackoff)
+	td.syncer.results["notes"] = func() (syncReport, error) {
+		return syncReport{}, &skipError{reason: "Git's index.lock has existed since 2026-09-17 04:05", stuck: true}
+	}
+	td.syncRepo(state, true)
+	if repo := td.statusSnapshot().Repositories[0]; repo.State != "stuck" {
+		t.Fatalf("status = %+v, want stuck", repo)
+	}
+}
+
 func TestSecretFilesNotifyOncePerIncident(t *testing.T) {
 	td := newTestDaemon(t, "notes")
 	blocked := []string{".env"}

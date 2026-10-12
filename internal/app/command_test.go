@@ -10,15 +10,31 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCommandRunnerUsesUnattendedGitEnvironment(t *testing.T) {
 	t.Setenv("GIT_SSL_VERSION", "tlsv1")
 	t.Setenv("GIT_TERMINAL_PROMPT", "1")
+	t.Setenv("GIT_OPTIONAL_LOCKS", "1")
 	_, err := (execCommandRunner{}).run(context.Background(), "", "", "/bin/sh", "-c",
-		`test -z "$GIT_SSL_VERSION" && test "$GIT_TERMINAL_PROMPT" = 0`)
+		`test -z "$GIT_SSL_VERSION" && test "$GIT_TERMINAL_PROMPT" = 0 && test "$GIT_OPTIONAL_LOCKS" = 0`)
 	if err != nil {
 		t.Fatalf("runner did not override unsafe Git environment: %v", err)
+	}
+}
+
+// A timed-out command gets SIGTERM, so Git can remove its lock files, instead
+// of a hard kill that leaves them behind.
+func TestCommandRunnerTimeoutLetsCommandCleanUp(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "cleaned-up")
+	_, err := (execCommandRunner{timeout: 200 * time.Millisecond}).run(context.Background(), "", "", "/bin/sh", "-c",
+		`trap 'touch "$0"; kill $!; exit 1' TERM; sleep 30 & wait`, marker)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("command was not given a chance to clean up: %v", err)
 	}
 }
 

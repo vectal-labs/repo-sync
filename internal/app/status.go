@@ -52,10 +52,10 @@ func (d *daemon) statusSnapshot() serviceStatus {
 			repo.State, repo.Detail = "retrying", state.conflictLoadError
 		case state.syncing:
 			repo.State = "syncing"
-		case state.incident != "":
-			repo.State, repo.Detail = "retrying", redactCredentials(state.incident)
 		case state.stuck:
 			repo.State, repo.Detail = "stuck", state.lastSkip
+		case state.incident != "":
+			repo.State, repo.Detail = "retrying", redactCredentials(state.incident)
 		case state.lastSkip != "":
 			repo.State, repo.Detail = "waiting", state.lastSkip
 		case !state.lastSuccess.IsZero():

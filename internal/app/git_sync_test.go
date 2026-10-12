@@ -1577,26 +1577,67 @@ func TestGitSyncSkipsWhileAnotherGitProcessHoldsTheIndex(t *testing.T) {
 	}
 }
 
-// A lock left by a crashed Git command is reported as stuck, never deleted.
-func TestGitSyncReportsStaleIndexLockAsStuck(t *testing.T) {
+// A lock left by a killed Git command, with no Git process left in the
+// repository, is removed and the next cycle syncs normally.
+func TestGitSyncRemovesAbandonedIndexLock(t *testing.T) {
+	remote, local := makeGitFixture(t)
+	write(t, local, "mine.txt", "mine\n")
+	lock := agedIndexLock(t, local, abandonedLockAfter+time.Minute)
+	repo := repoConfig{Name: "notes", Path: local, Remote: "origin"}
+	_, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repo, true)
+	var skip *skipError
+	if !errors.As(err, &skip) || skip.stuck || !strings.Contains(skip.reason, "removed "+lock) {
+		t.Fatalf("err = %v; want a skip reporting the removed lock", err)
+	}
+	if _, err := os.Stat(lock); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned lock was kept: %v", err)
+	}
+	if report, err := (gitSyncer{runner: execCommandRunner{}}).sync(context.Background(), repo, true); err != nil || !report.Pushed {
+		t.Fatalf("report = %+v, err = %v; want the next cycle to push", report, err)
+	}
+	if tree := gitOutput(t, local, "--git-dir", remote, "ls-tree", "-r", "--name-only", "main"); !strings.Contains(tree, "mine.txt") {
+		t.Fatalf("remote tree = %q, want mine.txt", tree)
+	}
+}
+
+// A Git process still working in the repository may own an old lock, like
+// `git commit` waiting for its editor. The lock is kept and reported as stuck.
+func TestGitSyncKeepsOldIndexLockWhileGitRunsInRepository(t *testing.T) {
 	_, local := makeGitFixture(t)
 	write(t, local, "mine.txt", "mine\n")
-	lock := filepath.Join(local, ".git", "index.lock")
-	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+	lock := agedIndexLock(t, local, staleLockAfter+time.Minute)
+	waiting := exec.Command("git", "hash-object", "--stdin")
+	waiting.Dir = filepath.Join(local, ".git")
+	stdin, err := waiting.StdinPipe()
+	if err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-staleLockAfter - time.Minute)
-	if err := os.Chtimes(lock, old, old); err != nil {
+	if err := waiting.Start(); err != nil {
 		t.Fatal(err)
 	}
-	_, err := gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
+	t.Cleanup(func() { stdin.Close(); waiting.Wait() })
+
+	_, err = gitSyncer{runner: execCommandRunner{}}.sync(context.Background(), repoConfig{Name: "notes", Path: local, Remote: "origin"}, true)
 	var skip *skipError
 	if !errors.As(err, &skip) || !skip.stuck || !strings.Contains(skip.reason, lock) {
 		t.Fatalf("err = %v; want a stuck skip naming %s", err, lock)
 	}
 	if _, err := os.Stat(lock); err != nil {
-		t.Fatalf("a stale lock must not be removed automatically: %v", err)
+		t.Fatalf("a lock a running Git process may own was removed: %v", err)
 	}
+}
+
+func agedIndexLock(t *testing.T, repo string, age time.Duration) string {
+	t.Helper()
+	lock := filepath.Join(repo, ".git", "index.lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-age)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	return lock
 }
 
 // A local branch named "origin/main" must never be mistaken for the remote.

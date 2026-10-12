@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -117,6 +118,35 @@ func (nativeProcessInspector) inspect(pid int) (ownedProcess, error) {
 		return process, os.ErrProcessDone
 	}
 	return process, nil
+}
+
+// gitRunningIn reports whether a Git process of this user has its current
+// directory inside one of dirs. Git runs from the repository it works on, also
+// with `git -C`. A Git process whose directory cannot be read counts as inside.
+func gitRunningIn(dirs ...string) (bool, error) {
+	pids, err := nativeProcessInspector{}.pids()
+	if err != nil {
+		return false, err
+	}
+	for _, pid := range pids {
+		name := make([]byte, 64)
+		n := C.proc_name(C.int(pid), unsafe.Pointer(&name[0]), C.uint32_t(len(name)))
+		if n <= 0 || !bytes.HasPrefix(name[:n], []byte("git")) {
+			continue
+		}
+		var info C.struct_proc_vnodepathinfo
+		size := C.int(C.sizeof_struct_proc_vnodepathinfo)
+		if C.proc_pidinfo(C.int(pid), C.PROC_PIDVNODEPATHINFO, 0, unsafe.Pointer(&info), size) != size {
+			return true, nil
+		}
+		cwd := C.GoString(&info.pvi_cdir.vip_path[0])
+		for _, dir := range dirs {
+			if cwd == dir || strings.HasPrefix(cwd, dir+"/") {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func (nativeProcessInspector) signal(pid int, signal syscall.Signal) error {

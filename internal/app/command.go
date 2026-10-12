@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,6 +25,9 @@ import (
 type commandRunner interface {
 	run(ctx context.Context, dir, stdin, name string, args ...string) (string, error)
 }
+
+// stopGrace is how long a timed-out command may take to exit after SIGTERM.
+const stopGrace = 5 * time.Second
 
 type execCommandRunner struct {
 	path    string
@@ -98,7 +102,14 @@ func (r execCommandRunner) run(ctx context.Context, dir, stdin, name string, arg
 	cmd.Dir = dir
 	// repo-sync is unattended. Never let Git wait for a terminal prompt, and
 	// ignore stale global TLS pins so Git can negotiate its secure default.
-	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSL_VERSION=")
+	// Reads such as `git status` skip Git's optional index.lock, so a read
+	// stopped halfway cannot leave one behind.
+	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSL_VERSION=", "GIT_OPTIONAL_LOCKS=0")
+	// A timeout, often a Mac that slept mid-command, asks the command to stop
+	// so Git removes its own lock files. A hard kill would leave them behind
+	// and block the repository; it is only the fallback.
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = stopGrace
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}

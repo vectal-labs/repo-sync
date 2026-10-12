@@ -10,10 +10,16 @@ import (
 	"time"
 )
 
-// A crashed Git command can leave index.lock behind forever. Real Git work
-// never holds it this long, so an older lock is reported as stuck. It is
-// never deleted automatically.
-const staleLockAfter = time.Hour
+// A Git command that is killed instead of stopped leaves index.lock behind,
+// and Git then refuses to touch the checkout forever. Real Git work never
+// holds the lock for minutes without a Git process running in the repository,
+// so such a lock is abandoned and removed. A lock that a running Git process
+// may own, such as `git commit` waiting for its editor, is never removed; it is
+// reported as stuck once it is an hour old.
+const (
+	abandonedLockAfter = 10 * time.Minute
+	staleLockAfter     = time.Hour
+)
 
 // checkout is repo-sync's ownership of a working tree for one operation.
 //
@@ -40,11 +46,33 @@ type checkout struct {
 	done   bool
 }
 
-func lockSkip(lock string, now time.Time) *skipError {
-	if info, err := os.Stat(lock); err == nil && now.Sub(info.ModTime()) >= staleLockAfter {
-		return &skipError{reason: fmt.Sprintf("Git's index.lock has existed since %s; if no Git command is running, delete %s", info.ModTime().Local().Format("2006-01-02 15:04"), lock), stuck: true}
+func lockSkip(lock, worktree string, now time.Time) *skipError {
+	info, err := os.Stat(lock)
+	if err != nil {
+		return &skipError{reason: "another git process is using the checkout (index.lock exists); will retry"}
+	}
+	age, since := now.Sub(info.ModTime()), info.ModTime().Local().Format("2006-01-02 15:04")
+	if age >= abandonedLockAfter && !gitBusy(worktree, filepath.Dir(lock)) && os.Remove(lock) == nil {
+		return &skipError{reason: fmt.Sprintf("removed %s, abandoned by a stopped Git command since %s; will retry", lock, since)}
+	}
+	if age >= staleLockAfter {
+		return &skipError{reason: fmt.Sprintf("Git's index.lock has existed since %s and a Git process may still be using it; finish or quit that Git command, or delete %s", since, lock), stuck: true}
 	}
 	return &skipError{reason: "another git process is using the checkout (index.lock exists); will retry"}
+}
+
+// gitBusy reports whether a Git process may be working in one of dirs. When
+// that cannot be determined, it assumes one is.
+func gitBusy(dirs ...string) bool {
+	for i, dir := range dirs {
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return true
+		}
+		dirs[i] = resolved
+	}
+	busy, err := gitRunningIn(dirs...)
+	return busy || err != nil
 }
 
 // lockCheckout takes the lock and then verifies, now that nothing can change,
@@ -66,7 +94,7 @@ func (s gitSyncer) lockCheckout(ctx context.Context, repo repoConfig, branch str
 	file, err := os.OpenFile(c.lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return nil, lockSkip(c.lock, time.Now())
+			return nil, lockSkip(c.lock, repo.Path, time.Now())
 		}
 		return nil, err
 	}
